@@ -11,7 +11,7 @@ from PIL import ImageTk
 from .camera import configure_camera_fps, open_camera, probe_cameras
 from .config import DEFAULT_VIDEO, FRAME_WINDOW_SIZE, RECORDINGS_DIR, TARGET_RECORD_FPS
 from .display import fit_size, frame_to_photo
-from .filters import FILTER_LABELS, FilterId, FrameFilter
+from .filters import FILTER_LABELS, PREV_FRAME_DIFF_FILTER_IDS, FilterId, FrameFilter
 from .recording import create_writer
 
 
@@ -409,10 +409,7 @@ class VideoViewerApp:
 
         previous = None
         window_frames = None
-        if self.frame_filter.filter_id in (
-            FilterId.FRAME_DIFF,
-            FilterId.DETECTION,
-        ):
+        if self.frame_filter.filter_id in PREV_FRAME_DIFF_FILTER_IDS:
             previous = self._previous_frame_for_diff(self.frame_index)
         elif self.frame_filter.filter_id == FilterId.FRAME_DIFF_WINDOW:
             window_frames = self._window_frames_for_diff(self.frame_index)

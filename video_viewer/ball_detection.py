@@ -25,14 +25,30 @@ def _is_circular_contour(contour: np.ndarray) -> bool:
     return BALL_CIRCULARITY_MIN < circularity <= BALL_CIRCULARITY_MAX
 
 
-def find_largest_ball_contour(cleaned: np.ndarray) -> np.ndarray | None:
+def find_circular_contours(cleaned: np.ndarray) -> list[np.ndarray]:
     gray = _to_gray(cleaned)
     contours, _ = cv2.findContours(gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return [c for c in contours if _is_circular_contour(c)]
 
-    valid_ball_contours = [c for c in contours if _is_circular_contour(c)]
+
+def find_largest_ball_contour(cleaned: np.ndarray) -> np.ndarray | None:
+    valid_ball_contours = find_circular_contours(cleaned)
     if not valid_ball_contours:
         return None
     return max(valid_ball_contours, key=cv2.contourArea)
+
+
+def draw_circular_contours(
+    frame: np.ndarray,
+    contours: list[np.ndarray],
+    *,
+    color: tuple[int, int, int] = (0, 255, 0),
+    thickness: int = 2,
+) -> np.ndarray:
+    output = frame.copy()
+    if contours:
+        cv2.drawContours(output, contours, -1, color, thickness)
+    return output
 
 
 def draw_ball_contour(
