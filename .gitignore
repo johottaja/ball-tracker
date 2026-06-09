@@ -11,3 +11,7 @@ wheels/
 
 # Recorded videos
 video_viewer/recordings/
+recordings/
+
+# Downloaded model weights
+*.pt

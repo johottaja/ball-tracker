@@ -19,6 +19,8 @@ uv sync
 
 ## Run
 
+**Video viewer** (record, playback, filters):
+
 ```bash
 uv run python -m video_viewer
 ```
@@ -28,6 +30,19 @@ Or:
 ```bash
 uv run python video_viewer/viewer.py
 ```
+
+**Training clip recorder** (named training sets, short clips):
+
+```bash
+uv run python -m training_recorder
+```
+
+## Using the training recorder
+
+- Enter a **Training set** name (e.g. `throws_v1`). Clips for the same name are saved together.
+- Choose a camera and use **Refresh** if needed.
+- **Start clip** / **Stop clip** saves each take as `recordings/<training_set>/clip_<timestamp>.mp4` at the repo root.
+- This folder is separate from `video_viewer/recordings/`, which the viewer uses for its single default recording.
 
 ## Using the viewer
 
@@ -91,6 +106,8 @@ Detection works best when the ball moves clearly between frames and the backgrou
 ```
 balltracker/
 ├── pyproject.toml          # dependencies (OpenCV, Pillow)
+├── recordings/             # training clips by set name (gitignored)
+├── training_recorder/      # training clip recorder GUI
 ├── video_viewer/
 │   ├── __main__.py         # entry point
 │   ├── app.py              # tkinter UI

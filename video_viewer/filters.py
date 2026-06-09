@@ -13,6 +13,7 @@ from .ball_detection import (
     find_circular_contours,
     find_largest_ball_contour,
 )
+from .pose_overlay import apply_normalized_throw_detection, apply_throw_detection
 from .config import (
     DIFF_BRIGHTNESS_FACTOR,
     DIFF_THRESH_VALUE,
@@ -29,6 +30,8 @@ class FilterId(str, Enum):
     FRAME_DIFF_CONTOURS = "frame_diff_contours"
     FRAME_DIFF_WINDOW = "frame_diff_window"
     DETECTION = "detection"
+    THROW_DETECTION = "throw_detection"
+    NORMALIZED_THROW_DETECTION = "normalized_throw_detection"
 
 
 FILTER_LABELS: dict[FilterId, str] = {
@@ -42,6 +45,8 @@ FILTER_LABELS: dict[FilterId, str] = {
         f"Diff window (current − mean of last {FRAME_WINDOW_SIZE})"
     ),
     FilterId.DETECTION: "Ball detection",
+    FilterId.THROW_DETECTION: "Throw detection",
+    FilterId.NORMALIZED_THROW_DETECTION: "Normalized throw detection",
 }
 
 # Filters that use the immediately previous frame as reference.
@@ -263,5 +268,11 @@ class FrameFilter:
             if window_frames is None:
                 self._frame_window.append(frame.copy())
             return result
+
+        if self.filter_id == FilterId.THROW_DETECTION:
+            return apply_throw_detection(frame)
+
+        if self.filter_id == FilterId.NORMALIZED_THROW_DETECTION:
+            return apply_normalized_throw_detection(frame)
 
         return frame
