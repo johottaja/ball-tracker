@@ -13,5 +13,11 @@ wheels/
 video_viewer/recordings/
 recordings/
 
+# Labelled throw-detection datasets
+throw_detection/training_sets/
+
+# Trained throw-detection GRU weights
+throw_detection/models/
+
 # Downloaded model weights
 *.pt

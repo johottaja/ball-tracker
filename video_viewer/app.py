@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from PIL import ImageTk
 
-from .camera import configure_camera_fps, open_camera, probe_cameras
+from .camera import CameraReader, configure_camera_fps, open_camera, probe_cameras
 from .config import DEFAULT_VIDEO, FRAME_WINDOW_SIZE, RECORDINGS_DIR, TARGET_RECORD_FPS
 from .display import fit_size, frame_to_photo
 from .filters import FILTER_LABELS, PREV_FRAME_DIFF_FILTER_IDS, FilterId, FrameFilter
@@ -27,7 +27,9 @@ class VideoViewerApp:
         self.video_path = tk.StringVar(value=str(DEFAULT_VIDEO))
 
         self.cap: cv2.VideoCapture | None = None
+        self.camera_reader: CameraReader | None = None
         self.writer: cv2.VideoWriter | None = None
+        self._preview_frame_id = 0
         self.recording = False
         self.playing = False
         self.frame_index = 0
@@ -214,9 +216,13 @@ class VideoViewerApp:
         if self.writer is not None:
             self.writer.release()
             self.writer = None
+        if self.camera_reader is not None:
+            self.camera_reader.stop()
+            self.camera_reader = None
         if self.cap is not None:
             self.cap.release()
             self.cap = None
+        self._preview_frame_id = 0
 
     def _set_camera_controls_enabled(self, enabled: bool) -> None:
         state = "readonly" if enabled else "disabled"
@@ -236,6 +242,9 @@ class VideoViewerApp:
 
         if not labels:
             self._cancel_after()
+            if self.camera_reader is not None:
+                self.camera_reader.stop()
+                self.camera_reader = None
             if self.cap is not None:
                 self.cap.release()
                 self.cap = None
@@ -266,9 +275,13 @@ class VideoViewerApp:
 
     def _open_camera(self, index: int) -> bool:
         self._cancel_after()
+        if self.camera_reader is not None:
+            self.camera_reader.stop()
+            self.camera_reader = None
         if self.cap is not None:
             self.cap.release()
             self.cap = None
+        self._preview_frame_id = 0
 
         self.cap = open_camera(index)
         if not self.cap.isOpened():
@@ -284,12 +297,18 @@ class VideoViewerApp:
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.display_size = fit_size(width, height)
+        self.camera_reader = CameraReader(self.cap)
+        self.camera_reader.start()
         self.status_var.set(
             f"Camera {index} — live preview @ {self.record_fps:.0f} fps. "
             f"Press Start recording to save to {DEFAULT_VIDEO.name}"
         )
         self._schedule_record_preview()
         return True
+
+    def _on_captured_frame(self, frame: np.ndarray) -> None:
+        if self.writer is not None:
+            self.writer.write(frame)
 
     def _enter_record_mode(self) -> None:
         self._release_capture()
@@ -328,13 +347,12 @@ class VideoViewerApp:
         self._update_status()
 
     def _schedule_record_preview(self) -> None:
-        if self.mode.get() != "record" or self.cap is None:
+        if self.mode.get() != "record" or self.camera_reader is None:
             return
-        ok, frame = self.cap.read()
-        if ok:
+        ok, frame, frame_id = self.camera_reader.get_latest_frame()
+        if ok and frame is not None and frame_id != self._preview_frame_id:
+            self._preview_frame_id = frame_id
             self._last_raw_frame = frame
-            if self.recording and self.writer is not None:
-                self.writer.write(frame)
             self._display_frame(frame, previous_frame=None)
         delay = max(1, int(1000 / self.record_fps))
         self.after_id = self.root.after(delay, self._schedule_record_preview)
@@ -354,6 +372,8 @@ class VideoViewerApp:
                 self.writer = None
                 return
             self.recording = True
+            if self.camera_reader is not None:
+                self.camera_reader.set_frame_consumer(self._on_captured_frame)
             self.record_btn.configure(text="Stop recording")
             self._set_camera_controls_enabled(False)
             self.status_var.set(
@@ -361,6 +381,8 @@ class VideoViewerApp:
             )
         else:
             self.recording = False
+            if self.camera_reader is not None:
+                self.camera_reader.set_frame_consumer(None)
             if self.writer is not None:
                 self.writer.release()
                 self.writer = None
@@ -409,18 +431,34 @@ class VideoViewerApp:
 
         previous = None
         window_frames = None
+        warmup_frames = None
         if self.frame_filter.filter_id in PREV_FRAME_DIFF_FILTER_IDS:
             previous = self._previous_frame_for_diff(self.frame_index)
         elif self.frame_filter.filter_id == FilterId.FRAME_DIFF_WINDOW:
             window_frames = self._window_frames_for_diff(self.frame_index)
+        elif self.frame_filter.filter_id == FilterId.GRU_THROW_INFERENCE:
+            warmup_frames = self._warmup_frames_for_gru(self.frame_index)
 
         self._display_frame(
             frame,
             previous_frame=previous,
             window_frames=window_frames,
+            warmup_frames=warmup_frames,
         )
         self._update_status()
         return True
+
+    def _warmup_frames_for_gru(self, index: int) -> list[np.ndarray] | None:
+        if index <= 0:
+            return None
+        buffer_size = self.frame_filter.throw_buffer_size()
+        start = max(0, index - buffer_size + 1)
+        warmup_frames: list[np.ndarray] = []
+        for frame_index in range(start, index):
+            ok, warmup_frame = self._read_frame_at(frame_index)
+            if ok:
+                warmup_frames.append(warmup_frame)
+        return warmup_frames or None
 
     def _display_frame(
         self,
@@ -428,11 +466,13 @@ class VideoViewerApp:
         *,
         previous_frame: np.ndarray | None = None,
         window_frames: list[np.ndarray] | None = None,
+        warmup_frames: list[np.ndarray] | None = None,
     ) -> None:
         filtered = self.frame_filter.apply(
             frame,
             previous_frame=previous_frame,
             window_frames=window_frames,
+            warmup_frames=warmup_frames,
         )
         self.frame_photo = frame_to_photo(filtered, self.display_size)
         self.video_label.configure(image=self.frame_photo, text="")
@@ -485,8 +525,7 @@ class VideoViewerApp:
             self.playing = False
             return
 
-        delay = max(1, int(1000 / self.fps))
-        self.after_id = self.root.after(delay, self._schedule_playback)
+        self.after_id = self.root.after(1, self._schedule_playback)
 
     def _on_close(self) -> None:
         self._release_capture()

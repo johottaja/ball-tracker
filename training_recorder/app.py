@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from PIL import ImageTk
 
-from video_viewer.camera import configure_camera_fps, open_camera, probe_cameras
+from video_viewer.camera import CameraReader, configure_camera_fps, open_camera, probe_cameras
 from video_viewer.display import fit_size, frame_to_photo
 from video_viewer.recording import create_writer
 
@@ -25,7 +25,9 @@ class TrainingRecorderApp:
         RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
 
         self.cap: cv2.VideoCapture | None = None
+        self.camera_reader: CameraReader | None = None
         self.writer: cv2.VideoWriter | None = None
+        self._preview_frame_id = 0
         self.recording = False
         self.record_fps = TARGET_RECORD_FPS
         self.frame_photo: ImageTk.PhotoImage | None = None
@@ -97,9 +99,13 @@ class TrainingRecorderApp:
         if self.writer is not None:
             self.writer.release()
             self.writer = None
+        if self.camera_reader is not None:
+            self.camera_reader.stop()
+            self.camera_reader = None
         if self.cap is not None:
             self.cap.release()
             self.cap = None
+        self._preview_frame_id = 0
 
     def _set_controls_enabled(self, enabled: bool) -> None:
         state = "readonly" if enabled else "disabled"
@@ -123,6 +129,9 @@ class TrainingRecorderApp:
 
         if not labels:
             self._cancel_after()
+            if self.camera_reader is not None:
+                self.camera_reader.stop()
+                self.camera_reader = None
             if self.cap is not None:
                 self.cap.release()
                 self.cap = None
@@ -153,9 +162,13 @@ class TrainingRecorderApp:
 
     def _open_camera(self, index: int) -> bool:
         self._cancel_after()
+        if self.camera_reader is not None:
+            self.camera_reader.stop()
+            self.camera_reader = None
         if self.cap is not None:
             self.cap.release()
             self.cap = None
+        self._preview_frame_id = 0
 
         self.cap = open_camera(index)
         if not self.cap.isOpened():
@@ -171,6 +184,8 @@ class TrainingRecorderApp:
         width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.display_size = fit_size(width, height)
+        self.camera_reader = CameraReader(self.cap)
+        self.camera_reader.start()
         set_name = self._active_training_set()
         self.status_var.set(
             f"Camera {index} — live preview @ {self.record_fps:.0f} fps. "
@@ -179,14 +194,17 @@ class TrainingRecorderApp:
         self._schedule_preview()
         return True
 
+    def _on_captured_frame(self, frame: np.ndarray) -> None:
+        if self.writer is not None:
+            self.writer.write(frame)
+
     def _schedule_preview(self) -> None:
-        if self.cap is None:
+        if self.camera_reader is None:
             return
-        ok, frame = self.cap.read()
-        if ok:
+        ok, frame, frame_id = self.camera_reader.get_latest_frame()
+        if ok and frame is not None and frame_id != self._preview_frame_id:
+            self._preview_frame_id = frame_id
             self._last_raw_frame = frame
-            if self.recording and self.writer is not None:
-                self.writer.write(frame)
             self._display_frame(frame)
         delay = max(1, int(1000 / self.record_fps))
         self.after_id = self.root.after(delay, self._schedule_preview)
@@ -209,6 +227,8 @@ class TrainingRecorderApp:
                 self.writer = None
                 return
             self.recording = True
+            if self.camera_reader is not None:
+                self.camera_reader.set_frame_consumer(self._on_captured_frame)
             self._current_clip_path = clip_path
             self.record_btn.configure(text="Stop clip")
             self._set_controls_enabled(False)
@@ -219,6 +239,8 @@ class TrainingRecorderApp:
             )
         else:
             self.recording = False
+            if self.camera_reader is not None:
+                self.camera_reader.set_frame_consumer(None)
             if self.writer is not None:
                 self.writer.release()
                 self.writer = None

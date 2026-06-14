@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from throw_detection.inference import default_throw_model_path
+
 PACKAGE_DIR = Path(__file__).resolve().parent
 RECORDINGS_DIR = PACKAGE_DIR / "recordings"
 DEFAULT_VIDEO = RECORDINGS_DIR / "recording.mp4"
@@ -17,3 +19,5 @@ DETECTION_RECT_THICKNESS = 6
 
 POSE_JOINT_RADIUS = 8
 POSE_BONE_THICKNESS = 3
+
+THROW_MODEL_PATH = default_throw_model_path()

@@ -8,11 +8,13 @@ from pose_detection import (
     JOINT_NAMES,
     DominantHand,
     DominantHandDetection,
+    PoseDetector,
     detect_dominant_hand,
     detect_dominant_hand_detection,
     normalize_hand_keypoints,
     torso_segment,
 )
+from throw_detection.inference import ThrowPrediction
 
 from .config import POSE_BONE_THICKNESS, POSE_JOINT_RADIUS
 
@@ -25,6 +27,14 @@ _BONE_COLOR = (255, 255, 255)
 _TORSO_SCALE_COLOR = (0, 165, 255)
 _READOUT_BG_COLOR = (0, 0, 0)
 _READOUT_TEXT_COLOR = (240, 240, 240)
+_LABEL_ZERO_BG = (128, 128, 128)
+_LABEL_ONE_BG = (0, 0, 220)
+_LABEL_TEXT_COLOR = (255, 255, 255)
+_LABEL_MARGIN = 16
+_LABEL_FONT = cv2.FONT_HERSHEY_DUPLEX
+_LABEL_FONT_SCALE = 2.0
+_LABEL_FONT_THICKNESS = 3
+_LABEL_PAD = 12
 
 
 def draw_dominant_hand(frame: np.ndarray, hand: DominantHand | None) -> np.ndarray:
@@ -153,8 +163,113 @@ def apply_throw_detection(frame: np.ndarray) -> np.ndarray:
     return draw_dominant_hand(frame, hand)
 
 
-def apply_normalized_throw_detection(frame: np.ndarray) -> np.ndarray:
-    detection = detect_dominant_hand_detection(frame)
+def draw_throw_label_badge(frame: np.ndarray, label: int) -> np.ndarray:
+    output = frame.copy()
+    text = str(int(label))
+    bg_color = _LABEL_ONE_BG if label else _LABEL_ZERO_BG
+
+    (text_width, text_height), baseline = cv2.getTextSize(
+        text,
+        _LABEL_FONT,
+        _LABEL_FONT_SCALE,
+        _LABEL_FONT_THICKNESS,
+    )
+    box_width = text_width + 2 * _LABEL_PAD
+    box_height = text_height + baseline + 2 * _LABEL_PAD
+    height, width = output.shape[:2]
+    bottom_right = (width - _LABEL_MARGIN, height - _LABEL_MARGIN)
+    top_left = (bottom_right[0] - box_width, bottom_right[1] - box_height)
+
+    cv2.rectangle(output, top_left, bottom_right, bg_color, -1)
+    text_origin = (
+        top_left[0] + _LABEL_PAD,
+        bottom_right[1] - _LABEL_PAD - baseline,
+    )
+    cv2.putText(
+        output,
+        text,
+        text_origin,
+        _LABEL_FONT,
+        _LABEL_FONT_SCALE,
+        _LABEL_TEXT_COLOR,
+        _LABEL_FONT_THICKNESS,
+        cv2.LINE_AA,
+    )
+    return output
+
+
+def _label_badge_height() -> int:
+    (text_width, text_height), baseline = cv2.getTextSize(
+        "0",
+        _LABEL_FONT,
+        _LABEL_FONT_SCALE,
+        _LABEL_FONT_THICKNESS,
+    )
+    return text_height + baseline + 2 * _LABEL_PAD
+
+
+def draw_throw_prediction_readout(frame: np.ndarray, prediction: ThrowPrediction) -> np.ndarray:
+    if prediction.has_pose:
+        line = f"logit {prediction.logit:+.2f}  p={prediction.probability:.2f}"
+    else:
+        line = "no pose"
+
+    margin = _LABEL_MARGIN
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.55
+    thickness = 2
+    height = frame.shape[0]
+    (text_width, text_height), baseline = cv2.getTextSize(
+        line,
+        font,
+        font_scale,
+        thickness,
+    )
+    y = height - margin - _label_badge_height() - 8
+    x = frame.shape[1] - margin - text_width
+    cv2.rectangle(
+        frame,
+        (x - 4, y - text_height - 2),
+        (x + text_width + 4, y + baseline + 2),
+        _READOUT_BG_COLOR,
+        -1,
+    )
+    cv2.putText(
+        frame,
+        line,
+        (x, y),
+        font,
+        font_scale,
+        _READOUT_TEXT_COLOR,
+        thickness,
+        cv2.LINE_AA,
+    )
+    return frame
+
+
+def apply_gru_throw_inference(
+    frame: np.ndarray,
+    prediction: ThrowPrediction,
+) -> np.ndarray:
+    detection = prediction.detection
+    if detection is None:
+        output = frame.copy()
+    else:
+        output = draw_dominant_hand(frame, detection.hand)
+        normalized_keypoints, scale, _anchor = normalize_hand_keypoints(detection)
+        output = draw_torso_scale_line(output, detection, scale=scale)
+        output = draw_normalized_readout(output, normalized_keypoints, scale)
+
+    output = draw_throw_prediction_readout(output, prediction)
+    return draw_throw_label_badge(output, prediction.label)
+
+
+def apply_normalized_throw_detection(
+    frame: np.ndarray,
+    *,
+    detector: PoseDetector | None = None,
+) -> np.ndarray:
+    detection = detect_dominant_hand_detection(frame, detector=detector)
     output = draw_dominant_hand(frame, detection.hand if detection else None)
     if detection is None:
         return output

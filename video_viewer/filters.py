@@ -13,12 +13,19 @@ from .ball_detection import (
     find_circular_contours,
     find_largest_ball_contour,
 )
-from .pose_overlay import apply_normalized_throw_detection, apply_throw_detection
+from throw_detection.inference import ThrowInference
+
+from .pose_overlay import (
+    apply_gru_throw_inference,
+    apply_normalized_throw_detection,
+    apply_throw_detection,
+)
 from .config import (
     DIFF_BRIGHTNESS_FACTOR,
     DIFF_THRESH_VALUE,
     FRAME_WINDOW_SIZE,
     MORPH_KERNEL_SIZE,
+    THROW_MODEL_PATH,
 )
 
 class FilterId(str, Enum):
@@ -32,6 +39,7 @@ class FilterId(str, Enum):
     DETECTION = "detection"
     THROW_DETECTION = "throw_detection"
     NORMALIZED_THROW_DETECTION = "normalized_throw_detection"
+    GRU_THROW_INFERENCE = "gru_throw_inference"
 
 
 FILTER_LABELS: dict[FilterId, str] = {
@@ -47,6 +55,7 @@ FILTER_LABELS: dict[FilterId, str] = {
     FilterId.DETECTION: "Ball detection",
     FilterId.THROW_DETECTION: "Throw detection",
     FilterId.NORMALIZED_THROW_DETECTION: "Normalized throw detection",
+    FilterId.GRU_THROW_INFERENCE: "GRU throw inference",
 }
 
 # Filters that use the immediately previous frame as reference.
@@ -218,15 +227,36 @@ class FrameFilter:
         self.filter_id = FilterId.NONE
         self._prev_frame: np.ndarray | None = None
         self._frame_window: deque[np.ndarray] = deque(maxlen=window_size)
+        self._throw_inference: ThrowInference | None = None
 
     def reset(self) -> None:
         self._prev_frame = None
         self._frame_window.clear()
+        if self._throw_inference is not None:
+            self._throw_inference.reset()
 
     def set_filter(self, filter_id: FilterId) -> None:
         if filter_id != self.filter_id:
             self.filter_id = filter_id
             self.reset()
+            if filter_id != FilterId.GRU_THROW_INFERENCE:
+                self._throw_inference = None
+
+    def throw_buffer_size(self) -> int:
+        inference = self._ensure_throw_inference()
+        if inference is None:
+            from throw_detection.config import BUFFER_SIZE
+
+            return BUFFER_SIZE
+        return inference.buffer_size
+
+    def _ensure_throw_inference(self) -> ThrowInference | None:
+        if self._throw_inference is not None:
+            return self._throw_inference
+        if THROW_MODEL_PATH is None or not THROW_MODEL_PATH.is_file():
+            return None
+        self._throw_inference = ThrowInference(THROW_MODEL_PATH)
+        return self._throw_inference
 
     def _apply_with_previous(
         self,
@@ -246,6 +276,7 @@ class FrameFilter:
         *,
         previous_frame: np.ndarray | None = None,
         window_frames: list[np.ndarray] | None = None,
+        warmup_frames: list[np.ndarray] | None = None,
     ) -> np.ndarray:
         if self.filter_id == FilterId.NONE:
             return frame
@@ -275,4 +306,28 @@ class FrameFilter:
         if self.filter_id == FilterId.NORMALIZED_THROW_DETECTION:
             return apply_normalized_throw_detection(frame)
 
+        if self.filter_id == FilterId.GRU_THROW_INFERENCE:
+            inference = self._ensure_throw_inference()
+            if inference is None:
+                output = apply_normalized_throw_detection(frame)
+                return _draw_missing_model_banner(output)
+            prediction = inference.predict(frame, warmup_frames=warmup_frames)
+            return apply_gru_throw_inference(frame, prediction)
+
         return frame
+
+
+def _draw_missing_model_banner(frame: np.ndarray) -> np.ndarray:
+    output = frame.copy()
+    line = "No GRU model in throw_detection/models/"
+    cv2.putText(
+        output,
+        line,
+        (16, 32),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (0, 0, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return output
