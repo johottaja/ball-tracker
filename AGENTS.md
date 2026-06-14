@@ -14,6 +14,7 @@ Guidance for AI agents working in this repository.
 - **`pose_detection/`** — reusable YOLO pose pipeline: per-frame dominant-hand selection and batch extraction of arm keypoints from frame sequences.
 - **`training_recorder/`** — lightweight GUI for recording labeled training clips. Enter a training set name; each clip is saved under `recordings/<training_set>/` at the repo root (separate from `video_viewer/recordings/`).
 - **`throw_detection/`** — throw-event labeling GUI, GRU training-data export, GRU training GUI, and streaming GRU inference. Labels per-frame throw/not-throw on clips from `recordings/<set>/`; saves NumPy `.npz` datasets under `throw_detection/training_sets/`; trained models under `throw_detection/models/`.
+- **`trajectory_tracking/`** — stateful ball trajectory tracker that combines throw inference with frame-diff ball detection. Three phases: detecting throw → scanning for ball in a circular sector from the wrist → tracking ball frame-by-frame. Fits a parabola to the collected positions and exposes drawing helpers for the video viewer filter.
 
 Multi-camera capture, stereo triangulation, trajectory reconstruction, and 3D visualization are not implemented yet.
 
@@ -82,6 +83,12 @@ balltracker/
 │   │   └── app.py            # tkinter training UI (hyperparams, progress, save)
 │   ├── training_sets/        # Saved .npz datasets (gitignored)
 │   └── models/               # Saved GRU checkpoints (gitignored)
+├── trajectory_tracking/      # Ball trajectory tracker
+│   ├── __init__.py
+│   ├── config.py             # sector, tracking, torso/speed constants
+│   ├── speed.py              # TorsoLengthBuffer, curve-length speed estimate
+│   ├── tracker.py            # Phase enum, TrajectoryResult, TrajectoryTracker
+│   └── drawing.py            # draw_trajectory_overlay (sector, points, parabola, speed)
 └── video_viewer/             # Viewer and CV debugging app
     ├── __init__.py
     ├── __main__.py           # `python -m video_viewer` entry
@@ -110,7 +117,7 @@ balltracker/
 | `extract.py` | `extract_dominant_hands` / `extract_normalized_dominant_hands` batch APIs |
 | `normalize.py` | Shoulder-anchored, torso-scaled keypoint normalization |
 | `types.py` | `Joint`, `DominantHand`, `DominantHandSequence` |
-| `config.py` | `POSE_MODEL_PATH`, `POSE_CONF_THRESHOLD`, `POSE_KEYPOINT_MIN_CONF` |
+| `config.py` | `POSE_MODEL_PATH`, `POSE_DEVICE`, `POSE_CONF_THRESHOLD`, `POSE_KEYPOINT_MIN_CONF` |
 | **video_viewer** | |
 | `app.py` | `VideoViewerApp` — modes (record/playback), UI, frame stepping, filter wiring |
 | `camera.py` | Open cameras (AVFoundation on macOS), probe indices, enforce min FPS; `CameraReader` captures on a background thread |
@@ -131,6 +138,11 @@ balltracker/
 | `labeller/overlay.py` | Normalized pose overlay + bottom-right label badge |
 | `trainer/app.py` | `ThrowTrainerApp` — pick `.npz` set, tune hyperparams, train, save `.pt` |
 | `inference.py` | `ThrowInference` — load `.pt`, rolling feature window, per-frame `ThrowPrediction` |
+| **trajectory_tracking** | |
+| `tracker.py` | `TrajectoryTracker` — three-phase state machine (detecting throw → scanning ball → tracking ball); fits parabola on trajectory exit; counts tracking frames per throw |
+| `speed.py` | `TorsoLengthBuffer` (10-frame rolling mean of shoulder→hip px); `estimate_throw_speed_m_s` from fitted curve length × torso scale ÷ tracking duration |
+| `drawing.py` | `draw_trajectory_overlay` — sector wedge, ball markers, active/completed points, fitted parabola, phase label, completed throw speed (top-right) |
+| `config.py` | `SECTOR_ANGLE_DEG`, `SECTOR_RADIUS_PX`, `TRACKING_TIMEOUT_FRAMES`, `BALL_CIRCULARITY_MIN/MAX`, `ASSUMED_TORSO_CM`, `TORSO_LENGTH_BUFFER_SIZE` |
 
 ## Filter pipeline (ball detection)
 
@@ -177,7 +189,27 @@ When training finishes (or is stopped), name the model and **Save** to `throw_de
 
 `ThrowInference(model_path)` loads a saved checkpoint and runs pose → normalized elbow/wrist features → causal rolling window → GRU logit on each frame. `predict(frame, warmup_frames=...)` returns a `ThrowPrediction` (`label`, `logit`, `probability`, `has_pose`, `detection`). Early window slots are zero-filled (matching training). Missing pose yields label `0` with zero logit.
 
-The video viewer **GRU throw inference** filter (`FilterId.GRU_THROW_INFERENCE`) uses the most recently modified `.pt` in `throw_detection/models/` (`video_viewer/config.py` → `THROW_MODEL_PATH`). Overlay: normalized pose, logit/probability readout, and bottom-right `0`/`1` badge (same colors as the labeller). Playback rebuilds the rolling buffer from prior frames on each seek so stepping backward stays correct.
+The video viewer **GRU throw inference** filter (`FilterId.GRU_THROW_INFERENCE`) uses the most recently modified `.pt` in `throw_detection/models/` (`video_viewer/config.py` → `THROW_MODEL_PATH`). Overlay: normalized pose, logit/probability readout, and bottom-right `0`/`1` badge (same colors as the labeller). During sequential forward playback, `ThrowInference` streams one new frame per step. On seeks, backward steps, filter changes, or other non-sequential jumps, the viewer rebuilds the rolling buffer from prior frames (YOLO on up to `buffer_size − 1` warmup frames plus the current frame).
+
+## Trajectory tracking (`trajectory_tracking`)
+
+`TrajectoryTracker` is a three-phase state machine called once per frame:
+
+1. **DETECTING_THROW** — waits for `throw_label == 1` from the GRU inference. When detected, moves to phase 2 using the wrist position as the sector origin.
+2. **SCANNING_BALL** — on every frame, re-anchors the sector at the wrist if the throw label is still 1. Searches the motion mask (frame-diff threshold) for the largest circular contour whose centroid lies inside a circular sector: `sector_radius` pixels from the wrist, centered on the elbow→wrist arm direction, ±`sector_half_angle` degrees wide. When a contour is found, transitions to phase 3.
+3. **TRACKING_BALL** — records ball centroid positions. Each frame the sector is re-centered on the last detection and the direction is updated to the previous→current ball vector. If `timeout_frames` consecutive frames yield no detection, the trajectory is finalised: `numpy.polyfit` fits a degree-2 polynomial (y=f(x) or x=f(y) depending on aspect ratio) and 120 sampled curve points are stored. The tracker then returns to phase 1.
+
+A new throw label while in phase 3 immediately finalises the current trajectory and re-enters phase 2.
+
+**Display (`FilterId.TRAJECTORY_TRACKING`):** renders all GRU inference overlays (pose skeleton, logit readout, label badge) plus:
+- Sector wedge outline (yellow-orange in phase 2, green in phase 3) at the current scan origin.
+- Orange dot at each frame's detected ball position.
+- Small teal dots for active trajectory points while tracking.
+- Completed trajectory: small purple dots + magenta parabola curve, shown until the next phase-3 entry clears them.
+- Phase label text in the top-left corner.
+- After a throw is fully tracked: speed readout in the top-right (`X.X m/s  Y.Y km/h`), inferred from fitted curve length × torso scale (50 cm assumed shoulder→hip, 10-frame rolling mean) ÷ tracking frame count at the video file's FPS (playback mode only).
+
+Tune via `trajectory_tracking/config.py`: `SECTOR_ANGLE_DEG`, `SECTOR_RADIUS_PX`, `TRACKING_TIMEOUT_FRAMES`, `BALL_CIRCULARITY_MIN/MAX`, `ASSUMED_TORSO_CM`, `TORSO_LENGTH_BUFFER_SIZE`.
 
 ## Configuration
 
@@ -191,7 +223,7 @@ The video viewer **GRU throw inference** filter (`FilterId.GRU_THROW_INFERENCE`)
 
 **`pose_detection/config.py`**
 
-- **Model:** `POSE_MODEL_PATH`, `POSE_CONF_THRESHOLD`, `POSE_KEYPOINT_MIN_CONF`
+- **Model:** `POSE_MODEL_PATH`, `POSE_DEVICE` (default `"mps"`), `POSE_CONF_THRESHOLD`, `POSE_KEYPOINT_MIN_CONF`
 
 **`training_recorder/config.py`**
 
@@ -202,6 +234,13 @@ The video viewer **GRU throw inference** filter (`FilterId.GRU_THROW_INFERENCE`)
 
 - **Paths:** `TRAINING_SETS_DIR`, `MODELS_DIR`, `REPO_ROOT`
 - **GRU input:** `BUFFER_SIZE` — rolling window length for normalized elbow/wrist features
+
+**`trajectory_tracking/config.py`**
+
+- **Sector:** `SECTOR_ANGLE_DEG` (full angular width, default 90°), `SECTOR_RADIUS_PX` (max search distance in pixels, default 200)
+- **Tracking:** `TRACKING_TIMEOUT_FRAMES` (consecutive miss frames before trajectory is finalised, default 3)
+- **Circularity:** `BALL_CIRCULARITY_MIN / MAX` (same defaults as ball detection: 0.5–1.0)
+- **Speed:** `ASSUMED_TORSO_CM` (default 50), `TORSO_LENGTH_BUFFER_SIZE` (default 10)
 
 ## Conventions
 

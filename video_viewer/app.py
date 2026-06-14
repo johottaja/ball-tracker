@@ -44,6 +44,7 @@ class VideoViewerApp:
         self.frame_filter = FrameFilter()
         self.filter_var = tk.StringVar(value=FilterId.NONE.value)
         self._last_raw_frame: np.ndarray | None = None
+        self._gru_stream_frame_index: int | None = None
 
         self._build_ui()
         self._build_menu()
@@ -169,6 +170,7 @@ class VideoViewerApp:
             self._on_filter_change()
 
     def _on_filter_change(self) -> None:
+        self._gru_stream_frame_index = None
         self.frame_filter.set_filter(FilterId(self.filter_var.get()))
         label = self._filter_label_by_value.get(self.filter_var.get(), "")
         if label and self.filter_combo.get() != label:
@@ -211,6 +213,7 @@ class VideoViewerApp:
 
     def _release_capture(self) -> None:
         self._cancel_after()
+        self._gru_stream_frame_index = None
         self.frame_filter.reset()
         self.playing = False
         if self.writer is not None:
@@ -436,8 +439,11 @@ class VideoViewerApp:
             previous = self._previous_frame_for_diff(self.frame_index)
         elif self.frame_filter.filter_id == FilterId.FRAME_DIFF_WINDOW:
             window_frames = self._window_frames_for_diff(self.frame_index)
-        elif self.frame_filter.filter_id == FilterId.GRU_THROW_INFERENCE:
-            warmup_frames = self._warmup_frames_for_gru(self.frame_index)
+        elif self.frame_filter.filter_id in (
+            FilterId.GRU_THROW_INFERENCE,
+            FilterId.TRAJECTORY_TRACKING,
+        ):
+            warmup_frames = self._gru_warmup_frames_if_needed(self.frame_index)
 
         self._display_frame(
             frame,
@@ -445,12 +451,25 @@ class VideoViewerApp:
             window_frames=window_frames,
             warmup_frames=warmup_frames,
         )
+        if self.frame_filter.filter_id in (
+            FilterId.GRU_THROW_INFERENCE,
+            FilterId.TRAJECTORY_TRACKING,
+        ):
+            self._gru_stream_frame_index = self.frame_index
         self._update_status()
         return True
 
-    def _warmup_frames_for_gru(self, index: int) -> list[np.ndarray] | None:
-        if index <= 0:
+    def _gru_warmup_frames_if_needed(self, index: int) -> list[np.ndarray] | None:
+        if (
+            self._gru_stream_frame_index is not None
+            and index == self._gru_stream_frame_index + 1
+        ):
             return None
+        return self._warmup_frames_for_gru(index)
+
+    def _warmup_frames_for_gru(self, index: int) -> list[np.ndarray]:
+        if index <= 0:
+            return []
         buffer_size = self.frame_filter.throw_buffer_size()
         start = max(0, index - buffer_size + 1)
         warmup_frames: list[np.ndarray] = []
@@ -458,7 +477,7 @@ class VideoViewerApp:
             ok, warmup_frame = self._read_frame_at(frame_index)
             if ok:
                 warmup_frames.append(warmup_frame)
-        return warmup_frames or None
+        return warmup_frames
 
     def _display_frame(
         self,
@@ -468,11 +487,13 @@ class VideoViewerApp:
         window_frames: list[np.ndarray] | None = None,
         warmup_frames: list[np.ndarray] | None = None,
     ) -> None:
+        video_fps = self.fps if self.mode.get() == "playback" else None
         filtered = self.frame_filter.apply(
             frame,
             previous_frame=previous_frame,
             window_frames=window_frames,
             warmup_frames=warmup_frames,
+            video_fps=video_fps,
         )
         self.frame_photo = frame_to_photo(filtered, self.display_size)
         self.video_label.configure(image=self.frame_photo, text="")

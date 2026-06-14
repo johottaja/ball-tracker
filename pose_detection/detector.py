@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from .config import POSE_CONF_THRESHOLD, POSE_KEYPOINT_MIN_CONF, POSE_MODEL_PATH
+from .config import (
+    POSE_CONF_THRESHOLD,
+    POSE_DEVICE,
+    POSE_KEYPOINT_MIN_CONF,
+    POSE_MODEL_PATH,
+)
 from .types import DominantHand, DominantHandDetection, HandSide, Joint
 
 # COCO pose indices for each arm (shoulder → elbow → wrist).
@@ -29,7 +34,12 @@ class PoseDetector:
     def detect(self, frame: np.ndarray) -> list[np.ndarray]:
         """Return keypoint arrays shaped (17, 3) as x, y, confidence per person."""
         model = self._ensure_model()
-        results = model(frame, conf=POSE_CONF_THRESHOLD, verbose=False)
+        results = model(
+            frame,
+            conf=POSE_CONF_THRESHOLD,
+            device=POSE_DEVICE,
+            verbose=False,
+        )
         if not results or results[0].keypoints is None:
             return []
 

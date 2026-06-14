@@ -14,6 +14,11 @@ from .ball_detection import (
     find_largest_ball_contour,
 )
 from throw_detection.inference import ThrowInference
+from pose_detection import torso_scale
+from trajectory_tracking import TrajectoryTracker
+from trajectory_tracking.config import SECTOR_ANGLE_DEG, SECTOR_RADIUS_PX
+from trajectory_tracking.drawing import draw_trajectory_overlay
+from trajectory_tracking.speed import TorsoLengthBuffer, estimate_throw_speed_m_s
 
 from .pose_overlay import (
     apply_gru_throw_inference,
@@ -40,6 +45,7 @@ class FilterId(str, Enum):
     THROW_DETECTION = "throw_detection"
     NORMALIZED_THROW_DETECTION = "normalized_throw_detection"
     GRU_THROW_INFERENCE = "gru_throw_inference"
+    TRAJECTORY_TRACKING = "trajectory_tracking"
 
 
 FILTER_LABELS: dict[FilterId, str] = {
@@ -56,6 +62,7 @@ FILTER_LABELS: dict[FilterId, str] = {
     FilterId.THROW_DETECTION: "Throw detection",
     FilterId.NORMALIZED_THROW_DETECTION: "Normalized throw detection",
     FilterId.GRU_THROW_INFERENCE: "GRU throw inference",
+    FilterId.TRAJECTORY_TRACKING: "Trajectory tracking",
 }
 
 # Filters that use the immediately previous frame as reference.
@@ -219,6 +226,9 @@ _PREV_FRAME_APPLIERS = {
 }
 
 
+_GRU_FILTER_IDS = frozenset({FilterId.GRU_THROW_INFERENCE, FilterId.TRAJECTORY_TRACKING})
+
+
 class FrameFilter:
     """Applies the selected filter for on-screen display."""
 
@@ -228,19 +238,33 @@ class FrameFilter:
         self._prev_frame: np.ndarray | None = None
         self._frame_window: deque[np.ndarray] = deque(maxlen=window_size)
         self._throw_inference: ThrowInference | None = None
+        self._trajectory_tracker: TrajectoryTracker | None = None
+        self._torso_length_buffer = TorsoLengthBuffer()
+        self._completed_speed_m_s: float | None = None
+        self._last_completion_id: int = 0
 
     def reset(self) -> None:
         self._prev_frame = None
         self._frame_window.clear()
         if self._throw_inference is not None:
             self._throw_inference.reset()
+        if self._trajectory_tracker is not None:
+            self._trajectory_tracker.reset()
+        self._torso_length_buffer.reset()
+        self._completed_speed_m_s = None
+        self._last_completion_id = 0
 
     def set_filter(self, filter_id: FilterId) -> None:
         if filter_id != self.filter_id:
             self.filter_id = filter_id
             self.reset()
-            if filter_id != FilterId.GRU_THROW_INFERENCE:
+            if filter_id not in _GRU_FILTER_IDS:
                 self._throw_inference = None
+            if filter_id != FilterId.TRAJECTORY_TRACKING:
+                self._trajectory_tracker = None
+                self._torso_length_buffer.reset()
+                self._completed_speed_m_s = None
+                self._last_completion_id = 0
 
     def throw_buffer_size(self) -> int:
         inference = self._ensure_throw_inference()
@@ -257,6 +281,11 @@ class FrameFilter:
             return None
         self._throw_inference = ThrowInference(THROW_MODEL_PATH)
         return self._throw_inference
+
+    def _ensure_trajectory_tracker(self) -> TrajectoryTracker:
+        if self._trajectory_tracker is None:
+            self._trajectory_tracker = TrajectoryTracker()
+        return self._trajectory_tracker
 
     def _apply_with_previous(
         self,
@@ -277,6 +306,7 @@ class FrameFilter:
         previous_frame: np.ndarray | None = None,
         window_frames: list[np.ndarray] | None = None,
         warmup_frames: list[np.ndarray] | None = None,
+        video_fps: float | None = None,
     ) -> np.ndarray:
         if self.filter_id == FilterId.NONE:
             return frame
@@ -314,7 +344,95 @@ class FrameFilter:
             prediction = inference.predict(frame, warmup_frames=warmup_frames)
             return apply_gru_throw_inference(frame, prediction)
 
+        if self.filter_id == FilterId.TRAJECTORY_TRACKING:
+            return self._apply_trajectory_tracking(
+                frame,
+                warmup_frames=warmup_frames,
+                video_fps=video_fps,
+            )
+
         return frame
+
+    def _apply_trajectory_tracking(
+        self,
+        frame: np.ndarray,
+        *,
+        warmup_frames: list[np.ndarray] | None,
+        video_fps: float | None,
+    ) -> np.ndarray:
+        inference = self._ensure_throw_inference()
+        tracker = self._ensure_trajectory_tracker()
+
+        if warmup_frames is not None:
+            tracker.reset()
+            self._prev_frame = warmup_frames[-1].copy() if warmup_frames else None
+            self._torso_length_buffer.reset()
+            self._completed_speed_m_s = None
+            self._last_completion_id = 0
+
+        if inference is None:
+            self._prev_frame = frame.copy()
+            output = apply_normalized_throw_detection(frame)
+            return _draw_missing_model_banner(output)
+
+        prediction = inference.predict(frame, warmup_frames=warmup_frames)
+
+        self._torso_length_buffer.add(_extract_torso_length_px(prediction.detection))
+
+        motion_mask = build_motion_mask(frame, self._prev_frame)
+        self._prev_frame = frame.copy()
+
+        wrist_pos = _extract_wrist_pos(prediction.detection)
+        tracking_result = tracker.update(
+            throw_label=prediction.label,
+            wrist_pos=wrist_pos,
+            motion_mask=motion_mask,
+        )
+
+        if tracking_result.completion_id != self._last_completion_id:
+            self._last_completion_id = tracking_result.completion_id
+            self._completed_speed_m_s = estimate_throw_speed_m_s(
+                tracking_result.fitted_curve_points,
+                self._torso_length_buffer.smoothed,
+                tracking_result.completed_tracking_frames,
+                video_fps,
+            )
+
+        output = apply_gru_throw_inference(frame, prediction)
+        return draw_trajectory_overlay(
+            output,
+            tracking_result,
+            tracker._sector_half_angle,
+            tracker.sector_radius,
+            speed_m_s=self._completed_speed_m_s,
+        )
+
+
+def _extract_wrist_pos(detection: object) -> tuple[int, int] | None:
+    """Return the wrist pixel position from a detection, or None."""
+    if detection is None:
+        return None
+    hand = getattr(detection, "hand", None)
+    if hand is None:
+        return None
+    joints = hand.joints
+    if len(joints) < 3:
+        return None
+    wrist = joints[2]
+    return (int(wrist.x), int(wrist.y))
+
+
+def _extract_torso_length_px(detection: object) -> float | None:
+    """Return dominant-side shoulder-to-hip length in pixels, or None."""
+    if detection is None:
+        return None
+    hand = getattr(detection, "hand", None)
+    if hand is None:
+        return None
+    person_keypoints = getattr(detection, "person_keypoints", None)
+    if person_keypoints is None:
+        return None
+    return torso_scale(person_keypoints, hand.side)
 
 
 def _draw_missing_model_banner(frame: np.ndarray) -> np.ndarray:

@@ -3,6 +3,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 POSE_MODEL_PATH = REPO_ROOT / "yolo11n-pose.pt"
 
+POSE_DEVICE = "mps"
 POSE_CONF_THRESHOLD = 0.25
 POSE_KEYPOINT_MIN_CONF = 0.3
 
