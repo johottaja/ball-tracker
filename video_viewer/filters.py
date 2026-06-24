@@ -46,7 +46,10 @@ class FilterId(str, Enum):
     NORMALIZED_THROW_DETECTION = "normalized_throw_detection"
     GRU_THROW_INFERENCE = "gru_throw_inference"
     TRAJECTORY_TRACKING = "trajectory_tracking"
+    STEREO_TRACKING = "stereo_tracking"
 
+
+STEREO_ONLY_FILTER_IDS = frozenset({FilterId.STEREO_TRACKING})
 
 FILTER_LABELS: dict[FilterId, str] = {
     FilterId.NONE: "None",
@@ -63,6 +66,7 @@ FILTER_LABELS: dict[FilterId, str] = {
     FilterId.NORMALIZED_THROW_DETECTION: "Normalized throw detection",
     FilterId.GRU_THROW_INFERENCE: "GRU throw inference",
     FilterId.TRAJECTORY_TRACKING: "Trajectory tracking",
+    FilterId.STEREO_TRACKING: "Stereo tracking",
 }
 
 # Filters that use the immediately previous frame as reference.

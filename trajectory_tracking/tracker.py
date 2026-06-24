@@ -10,7 +10,9 @@ import numpy as np
 from .config import (
     BALL_CIRCULARITY_MAX,
     BALL_CIRCULARITY_MIN,
+    MIN_TRAJECTORY_POINTS,
     SECTOR_ANGLE_DEG,
+    SECTOR_DIRECTION_DEG,
     SECTOR_RADIUS_PX,
     TRACKING_TIMEOUT_FRAMES,
 )
@@ -20,6 +22,7 @@ class Phase(str, Enum):
     DETECTING_THROW = "detecting_throw"
     SCANNING_BALL = "scanning_ball"
     TRACKING_BALL = "tracking_ball"
+    AWAITING_PARTNER = "awaiting_partner"
 
 
 @dataclass(frozen=True)
@@ -68,10 +71,12 @@ class TrajectoryTracker:
         self,
         *,
         sector_angle_deg: float = SECTOR_ANGLE_DEG,
+        sector_direction_deg: float = SECTOR_DIRECTION_DEG,
         sector_radius: int = SECTOR_RADIUS_PX,
         timeout_frames: int = TRACKING_TIMEOUT_FRAMES,
     ) -> None:
         self._sector_half_angle = sector_angle_deg / 2.0
+        self._sector_direction_deg = sector_direction_deg
         self.sector_radius = sector_radius
         self.timeout_frames = timeout_frames
 
@@ -84,10 +89,12 @@ class TrajectoryTracker:
         self._tracking_frame_count: int = 0
         self._completed_tracking_frames: int | None = None
         self._completion_id: int = 0
+        self._full_frame_scan: bool = False
 
     def reset(self) -> None:
         self.phase = Phase.DETECTING_THROW
         self._scan_origin = None
+        self._full_frame_scan = False
         self._miss_count = 0
         self._trajectory_points = []
         self._completed_trajectory = None
@@ -105,8 +112,13 @@ class TrajectoryTracker:
         throw_label: int,
         wrist_pos: tuple[int, int] | None,
         motion_mask: np.ndarray | None,
+        *,
+        defer_detecting_throw: bool = False,
     ) -> TrajectoryResult:
         """Advance the tracker by one frame and return a result snapshot."""
+        if self.phase == Phase.AWAITING_PARTNER:
+            return self._result_snapshot(None)
+
         detected_pos: tuple[int, int] | None = None
 
         if self.phase == Phase.DETECTING_THROW:
@@ -119,11 +131,9 @@ class TrajectoryTracker:
                 self._enter_scanning(wrist_pos)
 
             if motion_mask is not None and self._scan_origin is not None:
-                detected_pos = self._find_ball_in_sector(motion_mask)
+                detected_pos = self._find_ball(motion_mask)
                 if detected_pos is not None:
                     # First detection – transition to tracking.
-                    self._completed_trajectory = None
-                    self._fitted_curve_points = None
                     self._scan_origin = detected_pos
                     self._trajectory_points = [detected_pos]
                     self._miss_count = 0
@@ -138,7 +148,7 @@ class TrajectoryTracker:
                 self._enter_scanning(wrist_pos)
             else:
                 if motion_mask is not None:
-                    detected_pos = self._find_ball_in_sector(motion_mask)
+                    detected_pos = self._find_ball(motion_mask)
 
                 if detected_pos is not None:
                     self._scan_origin = detected_pos
@@ -148,12 +158,83 @@ class TrajectoryTracker:
                     self._miss_count += 1
                     if self._miss_count >= self.timeout_frames:
                         self._finalize_trajectory()
-                        self.phase = Phase.DETECTING_THROW
+                        self.phase = (
+                            Phase.AWAITING_PARTNER
+                            if defer_detecting_throw
+                            else Phase.DETECTING_THROW
+                        )
 
+        return self._result_snapshot(detected_pos)
+
+    def update_secondary(
+        self,
+        throw_label: int,
+        motion_mask: np.ndarray | None,
+        *,
+        defer_detecting_throw: bool = False,
+    ) -> TrajectoryResult:
+        """
+        Ball-only tracker for a secondary camera view.
+
+        Throw detection comes from the main camera (``throw_label`` only); ball
+        search starts with a full-frame scan because there is no wrist anchor.
+        """
+        if self.phase == Phase.AWAITING_PARTNER:
+            return self._result_snapshot(None)
+
+        detected_pos: tuple[int, int] | None = None
+
+        if self.phase == Phase.DETECTING_THROW:
+            if throw_label == 1:
+                self._enter_scanning_full_frame()
+
+        elif self.phase == Phase.SCANNING_BALL:
+            if motion_mask is not None:
+                detected_pos = self._find_ball(motion_mask)
+                if detected_pos is not None:
+                    self._full_frame_scan = False
+                    self._scan_origin = detected_pos
+                    self._trajectory_points = [detected_pos]
+                    self._miss_count = 0
+                    self._tracking_frame_count = 1
+                    self.phase = Phase.TRACKING_BALL
+
+        else:  # TRACKING_BALL
+            self._tracking_frame_count += 1
+            if throw_label == 1:
+                self._finalize_trajectory()
+                self._enter_scanning_full_frame()
+            else:
+                if motion_mask is not None:
+                    detected_pos = self._find_ball(motion_mask)
+
+                if detected_pos is not None:
+                    self._scan_origin = detected_pos
+                    self._trajectory_points.append(detected_pos)
+                    self._miss_count = 0
+                else:
+                    self._miss_count += 1
+                    if self._miss_count >= self.timeout_frames:
+                        self._finalize_trajectory()
+                        self.phase = (
+                            Phase.AWAITING_PARTNER
+                            if defer_detecting_throw
+                            else Phase.DETECTING_THROW
+                        )
+
+        return self._result_snapshot(detected_pos)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _result_snapshot(
+        self, detected_pos: tuple[int, int] | None
+    ) -> TrajectoryResult:
         return TrajectoryResult(
             phase=self.phase,
             scan_origin=self._scan_origin,
-            scan_direction_deg=180.0,
+            scan_direction_deg=self._sector_direction_deg,
             detected_ball_pos=detected_pos,
             trajectory_points=list(self._trajectory_points),
             completed_trajectory=self._completed_trajectory,
@@ -162,13 +243,17 @@ class TrajectoryTracker:
             completion_id=self._completion_id,
         )
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     def _enter_scanning(self, wrist_pos: tuple[int, int]) -> None:
         self.phase = Phase.SCANNING_BALL
         self._scan_origin = wrist_pos
+        self._full_frame_scan = False
+        self._trajectory_points = []
+        self._miss_count = 0
+
+    def _enter_scanning_full_frame(self) -> None:
+        self.phase = Phase.SCANNING_BALL
+        self._scan_origin = None
+        self._full_frame_scan = True
         self._trajectory_points = []
         self._miss_count = 0
 
@@ -176,7 +261,13 @@ class TrajectoryTracker:
         """Fit a parabola to collected points and save the completed trajectory."""
         points = self._trajectory_points
         tracking_frames = self._tracking_frame_count
-        self._completed_trajectory = list(points) if points else None
+        self._trajectory_points = []
+        self._tracking_frame_count = 0
+
+        if len(points) < MIN_TRAJECTORY_POINTS:
+            return
+
+        self._completed_trajectory = list(points)
         self._fitted_curve_points = None
 
         if len(points) >= 3:
@@ -209,14 +300,12 @@ class TrajectoryTracker:
             except (np.linalg.LinAlgError, ValueError):
                 pass
 
-        self._trajectory_points = []
-        self._tracking_frame_count = 0
-        self._completed_tracking_frames = tracking_frames if points else None
+        self._completed_tracking_frames = tracking_frames
         self._completion_id += 1
 
-    def _find_ball_in_sector(self, motion_mask: np.ndarray) -> tuple[int, int] | None:
-        """Return the centroid of the largest circular contour inside the sector."""
-        if self._scan_origin is None:
+    def _find_ball(self, motion_mask: np.ndarray) -> tuple[int, int] | None:
+        """Return the centroid of the largest circular contour in the search area."""
+        if not self._full_frame_scan and self._scan_origin is None:
             return None
 
         gray = (
@@ -233,7 +322,7 @@ class TrajectoryTracker:
             if not self._is_circular(contour):
                 continue
             cx, cy = self._centroid(contour)
-            if not self._in_sector(cx, cy):
+            if not self._full_frame_scan and not self._in_sector(cx, cy):
                 continue
             area = cv2.contourArea(contour)
             if area > best_area:
@@ -264,7 +353,6 @@ class TrajectoryTracker:
         dist = math.sqrt(dx**2 + dy**2)
         if dist > self.sector_radius:
             return False
-        # Sector always points left (180°).
         point_angle = math.degrees(math.atan2(dy, dx))
-        diff = (point_angle - 180 + 180) % 360 - 180
+        diff = (point_angle - self._sector_direction_deg + 180) % 360 - 180
         return abs(diff) <= self._sector_half_angle

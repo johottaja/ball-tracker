@@ -6,12 +6,18 @@ from tkinter import filedialog, messagebox, ttk
 
 import cv2
 import numpy as np
-from PIL import ImageTk
 
-from .camera import CameraReader, configure_camera_fps, open_camera, probe_cameras
-from .config import DEFAULT_VIDEO, FRAME_WINDOW_SIZE, RECORDINGS_DIR, TARGET_RECORD_FPS
-from .display import fit_size, frame_to_photo
-from .filters import FILTER_LABELS, PREV_FRAME_DIFF_FILTER_IDS, FilterId, FrameFilter
+from .camera import CameraDevice, CameraReader, configure_camera_fps, open_camera, probe_cameras
+from .config import DEFAULT_VIDEO, RECORDINGS_DIR, TARGET_RECORD_FPS
+from .display import fit_size
+from .filter_controls import FilterControls
+from .filters import FrameFilter
+from .playback import (
+    filter_inputs_for_playback,
+    frame_to_display_photo,
+    read_frame_at,
+    uses_gru_streaming,
+)
 from .recording import create_writer
 
 
@@ -36,13 +42,12 @@ class VideoViewerApp:
         self.frame_count = 0
         self.fps = TARGET_RECORD_FPS
         self.record_fps = TARGET_RECORD_FPS
-        self.frame_photo: ImageTk.PhotoImage | None = None
+        self.frame_photo = None
         self.after_id: str | None = None
         self.display_size = fit_size(640, 480)
         self.camera_index = 0
-        self.camera_indices: list[int] = []
+        self.cameras: list[CameraDevice] = []
         self.frame_filter = FrameFilter()
-        self.filter_var = tk.StringVar(value=FilterId.NONE.value)
         self._last_raw_frame: np.ndarray | None = None
         self._gru_stream_frame_index: int | None = None
 
@@ -75,18 +80,10 @@ class VideoViewerApp:
             side=tk.RIGHT
         )
 
-        filter_row = ttk.Frame(self.root, padding=(8, 0, 8, 0))
-        filter_row.pack(fill=tk.X)
-        ttk.Label(filter_row, text="Filter:").pack(side=tk.LEFT)
-        self.filter_combo = ttk.Combobox(
-            filter_row,
-            state="readonly",
-            width=42,
+        self.filter_controls = FilterControls(
+            self.root,
+            on_change=self._on_filter_change,
         )
-        self.filter_combo.pack(side=tk.LEFT, padx=(4, 0))
-        self.filter_combo.bind("<<ComboboxSelected>>", self._on_filter_combo)
-        self._sync_filter_combo_labels()
-        self.filter_combo.set(FILTER_LABELS[FilterId.NONE])
 
         self.video_label = ttk.Label(self.root, text="No video", anchor=tk.CENTER)
         self.video_label.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -142,39 +139,12 @@ class VideoViewerApp:
     def _build_menu(self) -> None:
         menubar = tk.Menu(self.root)
         self.root.config(menu=menubar)
-
-        filters_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Filters", menu=filters_menu)
-        for filter_id in FilterId:
-            filters_menu.add_radiobutton(
-                label=FILTER_LABELS[filter_id],
-                variable=self.filter_var,
-                value=filter_id.value,
-                command=self._on_filter_change,
-            )
-
-    def _sync_filter_combo_labels(self) -> None:
-        self._filter_value_by_label = {
-            FILTER_LABELS[fid]: fid.value for fid in FilterId
-        }
-        self._filter_label_by_value = {
-            value: label for label, value in self._filter_value_by_label.items()
-        }
-        self.filter_combo.configure(values=list(self._filter_value_by_label))
-
-    def _on_filter_combo(self, _event: object | None = None) -> None:
-        label = self.filter_combo.get()
-        value = self._filter_value_by_label.get(label)
-        if value is not None:
-            self.filter_var.set(value)
-            self._on_filter_change()
+        self.filter_controls.add_menu(menubar)
 
     def _on_filter_change(self) -> None:
         self._gru_stream_frame_index = None
-        self.frame_filter.set_filter(FilterId(self.filter_var.get()))
-        label = self._filter_label_by_value.get(self.filter_var.get(), "")
-        if label and self.filter_combo.get() != label:
-            self.filter_combo.set(label)
+        self.frame_filter.set_filter(self.filter_controls.selected_filter_id())
+        self.filter_controls.sync_combo_from_var()
         self._refresh_visible_frame()
 
     def _refresh_visible_frame(self) -> None:
@@ -184,21 +154,6 @@ class VideoViewerApp:
             self._show_frame_at(self.frame_index)
         elif self._last_raw_frame is not None:
             self._display_frame(self._last_raw_frame, previous_frame=None)
-
-    def _previous_frame_for_diff(self, index: int) -> np.ndarray | None:
-        if index <= 0:
-            return None
-        ok, frame = self._read_frame_at(index - 1)
-        return frame if ok else None
-
-    def _window_frames_for_diff(self, index: int) -> list[np.ndarray]:
-        frames: list[np.ndarray] = []
-        start = max(0, index - FRAME_WINDOW_SIZE)
-        for i in range(start, index):
-            ok, frame = self._read_frame_at(i)
-            if ok:
-                frames.append(frame)
-        return frames
 
     def _on_mode_change(self) -> None:
         if self.mode.get() == "record":
@@ -232,16 +187,24 @@ class VideoViewerApp:
         self.camera_combo.configure(state=state)
         self.refresh_cameras_btn.configure(state=tk.NORMAL if enabled else tk.DISABLED)
 
-    @staticmethod
-    def _camera_label(index: int) -> str:
+    def _camera_label(self, index: int) -> str:
+        for camera in self.cameras:
+            if camera.index == index:
+                return camera.label
+        return f"Camera {index}"
+
+    def _camera_name(self, index: int) -> str:
+        for camera in self.cameras:
+            if camera.index == index:
+                return camera.name
         return f"Camera {index}"
 
     def _refresh_cameras(self) -> None:
         if self.recording:
             return
 
-        self.camera_indices = probe_cameras()
-        labels = [self._camera_label(i) for i in self.camera_indices]
+        self.cameras = probe_cameras()
+        labels = [camera.label for camera in self.cameras]
 
         if not labels:
             self._cancel_after()
@@ -258,8 +221,9 @@ class VideoViewerApp:
             return
 
         self.camera_combo.configure(values=labels)
-        if self.camera_index not in self.camera_indices:
-            self.camera_index = self.camera_indices[0]
+        camera_indices = [camera.index for camera in self.cameras]
+        if self.camera_index not in camera_indices:
+            self.camera_index = camera_indices[0]
         self.camera_var.set(self._camera_label(self.camera_index))
         self._open_camera(self.camera_index)
 
@@ -267,9 +231,11 @@ class VideoViewerApp:
         if self.recording:
             return
         label = self.camera_var.get()
-        try:
-            index = int(label.removeprefix("Camera "))
-        except ValueError:
+        index = next(
+            (camera.index for camera in self.cameras if camera.label == label),
+            None,
+        )
+        if index is None:
             return
         if index == self.camera_index and self.cap is not None and self.cap.isOpened():
             return
@@ -288,11 +254,12 @@ class VideoViewerApp:
 
         self.cap = open_camera(index)
         if not self.cap.isOpened():
+            camera_name = self._camera_name(index)
             messagebox.showerror(
                 "Camera error",
-                f"Could not open camera {index}. Check permissions and try again.",
+                f"Could not open {camera_name}. Check permissions and try again.",
             )
-            self.status_var.set(f"Camera {index} unavailable.")
+            self.status_var.set(f"{camera_name} unavailable.")
             return False
 
         self.camera_index = index
@@ -303,7 +270,7 @@ class VideoViewerApp:
         self.camera_reader = CameraReader(self.cap)
         self.camera_reader.start()
         self.status_var.set(
-            f"Camera {index} — live preview @ {self.record_fps:.0f} fps. "
+            f"{self._camera_name(index)} — live preview @ {self.record_fps:.0f} fps. "
             f"Press Start recording to save to {DEFAULT_VIDEO.name}"
         )
         self._schedule_record_preview()
@@ -361,12 +328,12 @@ class VideoViewerApp:
         self.after_id = self.root.after(delay, self._schedule_record_preview)
 
     def _toggle_recording(self) -> None:
-        if self.cap is None or not self.cap.isOpened():
+        if self.camera_reader is None:
             return
 
         if not self.recording:
-            width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            width = self.camera_reader.frame_width
+            height = self.camera_reader.frame_height
             self.writer = create_writer(self.record_fps, width, height)
             if not self.writer.isOpened():
                 messagebox.showerror(
@@ -411,12 +378,6 @@ class VideoViewerApp:
         self.mode.set("playback")
         self._enter_playback_mode()
 
-    def _read_frame_at(self, index: int) -> tuple[bool, object]:
-        if self.cap is None:
-            return False, None
-        self.cap.set(cv2.CAP_PROP_POS_FRAMES, index)
-        return self.cap.read()
-
     def _show_frame_at(self, index: int) -> bool:
         if self.cap is None:
             return False
@@ -424,26 +385,20 @@ class VideoViewerApp:
         if self.frame_count > 0:
             index = min(index, self.frame_count - 1)
 
-        ok, frame = self._read_frame_at(index)
-        if not ok:
+        ok, frame = read_frame_at(self.cap, index)
+        if not ok or frame is None:
             return False
 
         self.frame_index = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
         if self.frame_index < 0:
             self.frame_index = index
 
-        previous = None
-        window_frames = None
-        warmup_frames = None
-        if self.frame_filter.filter_id in PREV_FRAME_DIFF_FILTER_IDS:
-            previous = self._previous_frame_for_diff(self.frame_index)
-        elif self.frame_filter.filter_id == FilterId.FRAME_DIFF_WINDOW:
-            window_frames = self._window_frames_for_diff(self.frame_index)
-        elif self.frame_filter.filter_id in (
-            FilterId.GRU_THROW_INFERENCE,
-            FilterId.TRAJECTORY_TRACKING,
-        ):
-            warmup_frames = self._gru_warmup_frames_if_needed(self.frame_index)
+        previous, window_frames, warmup_frames = filter_inputs_for_playback(
+            self.cap,
+            self.frame_filter,
+            self.frame_index,
+            self._gru_stream_frame_index,
+        )
 
         self._display_frame(
             frame,
@@ -451,33 +406,10 @@ class VideoViewerApp:
             window_frames=window_frames,
             warmup_frames=warmup_frames,
         )
-        if self.frame_filter.filter_id in (
-            FilterId.GRU_THROW_INFERENCE,
-            FilterId.TRAJECTORY_TRACKING,
-        ):
+        if uses_gru_streaming(self.frame_filter):
             self._gru_stream_frame_index = self.frame_index
         self._update_status()
         return True
-
-    def _gru_warmup_frames_if_needed(self, index: int) -> list[np.ndarray] | None:
-        if (
-            self._gru_stream_frame_index is not None
-            and index == self._gru_stream_frame_index + 1
-        ):
-            return None
-        return self._warmup_frames_for_gru(index)
-
-    def _warmup_frames_for_gru(self, index: int) -> list[np.ndarray]:
-        if index <= 0:
-            return []
-        buffer_size = self.frame_filter.throw_buffer_size()
-        start = max(0, index - buffer_size + 1)
-        warmup_frames: list[np.ndarray] = []
-        for frame_index in range(start, index):
-            ok, warmup_frame = self._read_frame_at(frame_index)
-            if ok:
-                warmup_frames.append(warmup_frame)
-        return warmup_frames
 
     def _display_frame(
         self,
@@ -488,14 +420,15 @@ class VideoViewerApp:
         warmup_frames: list[np.ndarray] | None = None,
     ) -> None:
         video_fps = self.fps if self.mode.get() == "playback" else None
-        filtered = self.frame_filter.apply(
+        self.frame_photo = frame_to_display_photo(
+            self.frame_filter,
             frame,
+            self.display_size,
             previous_frame=previous_frame,
             window_frames=window_frames,
             warmup_frames=warmup_frames,
             video_fps=video_fps,
         )
-        self.frame_photo = frame_to_photo(filtered, self.display_size)
         self.video_label.configure(image=self.frame_photo, text="")
 
     def _update_status(self) -> None:

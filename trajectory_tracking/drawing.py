@@ -132,9 +132,8 @@ def draw_trajectory_overlay(
     for pt in result.trajectory_points:
         cv2.circle(output, pt, _ACTIVE_PT_RADIUS, _ACTIVE_PT_COLOR, -1)
 
-    # Completed trajectory is shown until a new tracking phase begins.
-    show_completed = result.phase != Phase.TRACKING_BALL
-    if show_completed and result.completed_trajectory:
+    # Completed trajectory and curve persist until replaced by a valid finalize.
+    if result.completed_trajectory:
         for pt in result.completed_trajectory:
             cv2.circle(output, pt, _COMPLETED_PT_RADIUS, _COMPLETED_PT_COLOR, -1)
 
@@ -145,12 +144,8 @@ def draw_trajectory_overlay(
     # Phase label (top-left).
     _draw_phase_label(output, result.phase)
 
-    # Speed label (top-right) once a trajectory is fully tracked.
-    if (
-        speed_m_s is not None
-        and result.completed_trajectory
-        and result.phase != Phase.TRACKING_BALL
-    ):
+    # Speed label (top-right) for the last valid completed trajectory.
+    if speed_m_s is not None and result.completed_trajectory:
         _draw_speed_label(output, speed_m_s)
 
     return output

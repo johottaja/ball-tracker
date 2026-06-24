@@ -3,11 +3,18 @@ from __future__ import annotations
 # Angular width of the ball-search sector, in degrees.
 SECTOR_ANGLE_DEG: float = 150.0
 
+# Center direction of the ball-search sector (screen coords: 0=right, 90=down).
+# Default 135° = 45° counter-clockwise from left, tilting the wedge downward.
+SECTOR_DIRECTION_DEG: float = 165.0
+
 # Maximum distance (pixels) from the sector origin to accept a contour.
 SECTOR_RADIUS_PX: int = 400
 
 # Consecutive frames with no ball detection before the trajectory is finalised.
 TRACKING_TIMEOUT_FRAMES: int = 3
+
+# Trajectories with fewer detected ball positions are discarded (not shown).
+MIN_TRAJECTORY_POINTS: int = 5
 
 # Circularity range for contours accepted as ball candidates.
 BALL_CIRCULARITY_MIN: float = 0.5

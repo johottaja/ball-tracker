@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 from PIL import ImageTk
 
-from video_viewer.camera import CameraReader, configure_camera_fps, open_camera, probe_cameras
+from video_viewer.camera import CameraDevice, CameraReader, configure_camera_fps, open_camera, probe_cameras
 from video_viewer.display import fit_size, frame_to_photo
 from video_viewer.recording import create_writer
 
@@ -34,7 +34,7 @@ class TrainingRecorderApp:
         self.after_id: str | None = None
         self.display_size = fit_size(640, 480)
         self.camera_index = 0
-        self.camera_indices: list[int] = []
+        self.cameras: list[CameraDevice] = []
         self._last_raw_frame: np.ndarray | None = None
         self._current_clip_path: Path | None = None
         self.clips_recorded = 0
@@ -113,8 +113,16 @@ class TrainingRecorderApp:
         self.refresh_cameras_btn.configure(state=tk.NORMAL if enabled else tk.DISABLED)
         self.training_set_entry.configure(state=tk.NORMAL if enabled else tk.DISABLED)
 
-    @staticmethod
-    def _camera_label(index: int) -> str:
+    def _camera_label(self, index: int) -> str:
+        for camera in self.cameras:
+            if camera.index == index:
+                return camera.label
+        return f"Camera {index}"
+
+    def _camera_name(self, index: int) -> str:
+        for camera in self.cameras:
+            if camera.index == index:
+                return camera.name
         return f"Camera {index}"
 
     def _active_training_set(self) -> str:
@@ -124,8 +132,8 @@ class TrainingRecorderApp:
         if self.recording:
             return
 
-        self.camera_indices = probe_cameras()
-        labels = [self._camera_label(i) for i in self.camera_indices]
+        self.cameras = probe_cameras()
+        labels = [camera.label for camera in self.cameras]
 
         if not labels:
             self._cancel_after()
@@ -142,8 +150,9 @@ class TrainingRecorderApp:
             return
 
         self.camera_combo.configure(values=labels)
-        if self.camera_index not in self.camera_indices:
-            self.camera_index = self.camera_indices[0]
+        camera_indices = [camera.index for camera in self.cameras]
+        if self.camera_index not in camera_indices:
+            self.camera_index = camera_indices[0]
         self.camera_var.set(self._camera_label(self.camera_index))
         self._open_camera(self.camera_index)
 
@@ -151,9 +160,11 @@ class TrainingRecorderApp:
         if self.recording:
             return
         label = self.camera_var.get()
-        try:
-            index = int(label.removeprefix("Camera "))
-        except ValueError:
+        index = next(
+            (camera.index for camera in self.cameras if camera.label == label),
+            None,
+        )
+        if index is None:
             return
         if index == self.camera_index and self.cap is not None and self.cap.isOpened():
             return
@@ -172,11 +183,12 @@ class TrainingRecorderApp:
 
         self.cap = open_camera(index)
         if not self.cap.isOpened():
+            camera_name = self._camera_name(index)
             messagebox.showerror(
                 "Camera error",
-                f"Could not open camera {index}. Check permissions and try again.",
+                f"Could not open {camera_name}. Check permissions and try again.",
             )
-            self.status_var.set(f"Camera {index} unavailable.")
+            self.status_var.set(f"{camera_name} unavailable.")
             return False
 
         self.camera_index = index
@@ -188,7 +200,7 @@ class TrainingRecorderApp:
         self.camera_reader.start()
         set_name = self._active_training_set()
         self.status_var.set(
-            f"Camera {index} — live preview @ {self.record_fps:.0f} fps. "
+            f"{self._camera_name(index)} — live preview @ {self.record_fps:.0f} fps. "
             f"Clips save to recordings/{set_name}/"
         )
         self._schedule_preview()

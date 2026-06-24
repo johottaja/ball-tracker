@@ -8,15 +8,16 @@ Guidance for AI agents working in this repository.
 
 **balltracker** is a beer pong throw tracker. The long-term goal is to record a table from two cameras at different angles, track each ball’s trajectory through the throw, and display all throws on a 3D map.
 
-**Current state:** Four Python desktop apps plus shared detection libraries:
+**Current state:** Five Python desktop apps plus shared detection libraries:
 
 - **`video_viewer/`** — record webcam video and inspect it frame by frame. Includes computer-vision filters for debugging and two detection pipelines: **ball detection** (frame diff → threshold → circularity filter) and **throw detection** (YOLOv11 pose overlay via `pose_detection`).
+- **`stereo_viewer/`** — dual-camera version of the video viewer: side-by-side live preview and playback, same filter set applied independently per camera (plus **Stereo tracking**, stereo-only). Records synchronized `left.mp4` and `right.mp4` under `stereo_viewer/recordings/`.
 - **`pose_detection/`** — reusable YOLO pose pipeline: per-frame dominant-hand selection and batch extraction of arm keypoints from frame sequences.
 - **`training_recorder/`** — lightweight GUI for recording labeled training clips. Enter a training set name; each clip is saved under `recordings/<training_set>/` at the repo root (separate from `video_viewer/recordings/`).
 - **`throw_detection/`** — throw-event labeling GUI, GRU training-data export, GRU training GUI, and streaming GRU inference. Labels per-frame throw/not-throw on clips from `recordings/<set>/`; saves NumPy `.npz` datasets under `throw_detection/training_sets/`; trained models under `throw_detection/models/`.
 - **`trajectory_tracking/`** — stateful ball trajectory tracker that combines throw inference with frame-diff ball detection. Three phases: detecting throw → scanning for ball in a circular sector from the wrist → tracking ball frame-by-frame. Fits a parabola to the collected positions and exposes drawing helpers for the video viewer filter.
 
-Multi-camera capture, stereo triangulation, trajectory reconstruction, and 3D visualization are not implemented yet.
+Dual-camera synchronized recording is available via `stereo_viewer`. Stereo triangulation, trajectory reconstruction, and 3D visualization are not implemented yet.
 
 ## Tech stack
 
@@ -32,6 +33,7 @@ Multi-camera capture, stereo triangulation, trajectory reconstruction, and 3D vi
 ```bash
 uv sync
 uv run python -m video_viewer
+uv run python -m stereo_viewer
 uv run python -m training_recorder
 uv run python -m throw_detection.labeller <set_name>
 uv run python -m throw_detection.trainer
@@ -39,7 +41,7 @@ uv run python -m throw_detection.trainer
 
 Alternative entry: `uv run python video_viewer/viewer.py`
 
-`main.py` at the repo root is a placeholder; use `video_viewer`, `training_recorder`, `throw_detection.labeller`, or `throw_detection.trainer` to run an app.
+`main.py` at the repo root is a placeholder; use `video_viewer`, `stereo_viewer`, `training_recorder`, `throw_detection.labeller`, or `throw_detection.trainer` to run an app.
 
 ## Project structure
 
@@ -89,14 +91,24 @@ balltracker/
 │   ├── speed.py              # TorsoLengthBuffer, curve-length speed estimate
 │   ├── tracker.py            # Phase enum, TrajectoryResult, TrajectoryTracker
 │   └── drawing.py            # draw_trajectory_overlay (sector, points, parabola, speed)
+├── stereo_viewer/            # Dual-camera viewer (side-by-side)
+│   ├── __init__.py
+│   ├── __main__.py           # `python -m stereo_viewer` entry
+│   ├── app.py                # StereoViewerApp — two cameras, shared controls/filters
+│   ├── config.py             # LEFT_VIDEO, RIGHT_VIDEO, stereo display size
+│   ├── display.py            # Side-by-side frame compositing for tkinter
+│   ├── stereo_tracking.py    # Stereo tracking filter: main GRU + secondary ball trajectory
+│   └── recordings/           # Default left.mp4 / right.mp4 (gitignored)
 └── video_viewer/             # Viewer and CV debugging app
     ├── __init__.py
     ├── __main__.py           # `python -m video_viewer` entry
     ├── viewer.py             # Direct-run shim (adds parent to sys.path)
-    ├── app.py                # tkinter UI: record/playback, filters, controls
+    ├── app.py                # VideoViewerApp — record/playback, filters, controls
     ├── camera.py             # Webcam open, FPS config, camera probing
     ├── config.py             # Paths and tuning constants
     ├── display.py            # Resize frames for UI display
+    ├── filter_controls.py    # Shared filter combobox + Filters menu widget
+    ├── playback.py           # Shared playback helpers (seek, diff/GRU context, render)
     ├── recording.py          # VideoWriter helper
     ├── filters.py            # Filter registry and FrameFilter pipeline
     ├── ball_detection.py     # Contour/circularity logic and ball overlays
@@ -118,8 +130,15 @@ balltracker/
 | `normalize.py` | Shoulder-anchored, torso-scaled keypoint normalization |
 | `types.py` | `Joint`, `DominantHand`, `DominantHandSequence` |
 | `config.py` | `POSE_MODEL_PATH`, `POSE_DEVICE`, `POSE_CONF_THRESHOLD`, `POSE_KEYPOINT_MIN_CONF` |
+| **stereo_viewer** | |
+| `stereo_viewer/app.py` | `StereoViewerApp` — two camera streams, side-by-side preview/playback, independent `FrameFilter` per camera (or coordinated **Stereo tracking**) |
+| `stereo_viewer/config.py` | `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `STEREO_DISPLAY_MAX_SIZE` |
+| `stereo_viewer/display.py` | `panel_size_for_frame`, `stereo_frame_to_photo` (horizontal composite) |
+| `stereo_viewer/stereo_tracking.py` | `StereoTrackingProcessor` — main GRU + ball track on both cameras; secondary ball-only track |
 | **video_viewer** | |
 | `app.py` | `VideoViewerApp` — modes (record/playback), UI, frame stepping, filter wiring |
+| `filter_controls.py` | `FilterControls` — filter combobox + Filters menu (used by both viewers) |
+| `playback.py` | Seek helpers, diff/GRU warmup context, `frame_to_display_photo` |
 | `camera.py` | Open cameras (AVFoundation on macOS), probe indices, enforce min FPS; `CameraReader` captures on a background thread |
 | `config.py` | `RECORDINGS_DIR`, ball-detection thresholds, pose overlay drawing sizes |
 | `filters.py` | `FilterId` enum, diff pipeline stages, `FrameFilter` state |
@@ -142,7 +161,7 @@ balltracker/
 | `tracker.py` | `TrajectoryTracker` — three-phase state machine (detecting throw → scanning ball → tracking ball); fits parabola on trajectory exit; counts tracking frames per throw |
 | `speed.py` | `TorsoLengthBuffer` (10-frame rolling mean of shoulder→hip px); `estimate_throw_speed_m_s` from fitted curve length × torso scale ÷ tracking duration |
 | `drawing.py` | `draw_trajectory_overlay` — sector wedge, ball markers, active/completed points, fitted parabola, phase label, completed throw speed (top-right) |
-| `config.py` | `SECTOR_ANGLE_DEG`, `SECTOR_RADIUS_PX`, `TRACKING_TIMEOUT_FRAMES`, `BALL_CIRCULARITY_MIN/MAX`, `ASSUMED_TORSO_CM`, `TORSO_LENGTH_BUFFER_SIZE` |
+| `config.py` | `SECTOR_ANGLE_DEG`, `SECTOR_DIRECTION_DEG`, `SECTOR_RADIUS_PX`, `TRACKING_TIMEOUT_FRAMES`, `BALL_CIRCULARITY_MIN/MAX`, `ASSUMED_TORSO_CM`, `TORSO_LENGTH_BUFFER_SIZE` |
 
 ## Filter pipeline (ball detection)
 
@@ -205,11 +224,13 @@ A new throw label while in phase 3 immediately finalises the current trajectory 
 - Sector wedge outline (yellow-orange in phase 2, green in phase 3) at the current scan origin.
 - Orange dot at each frame's detected ball position.
 - Small teal dots for active trajectory points while tracking.
-- Completed trajectory: small purple dots + magenta parabola curve, shown until the next phase-3 entry clears them.
+- Completed trajectory: small purple dots + magenta parabola curve, shown until another valid trajectory is finalised.
 - Phase label text in the top-left corner.
 - After a throw is fully tracked: speed readout in the top-right (`X.X m/s  Y.Y km/h`), inferred from fitted curve length × torso scale (50 cm assumed shoulder→hip, 10-frame rolling mean) ÷ tracking frame count at the video file's FPS (playback mode only).
 
-Tune via `trajectory_tracking/config.py`: `SECTOR_ANGLE_DEG`, `SECTOR_RADIUS_PX`, `TRACKING_TIMEOUT_FRAMES`, `BALL_CIRCULARITY_MIN/MAX`, `ASSUMED_TORSO_CM`, `TORSO_LENGTH_BUFFER_SIZE`.
+**Stereo viewer (`FilterId.STEREO_TRACKING`, stereo viewer only):** left (main) camera runs GRU throw inference (pose skeleton, logit, label badge) plus wrist-anchored ball tracking. The right (secondary) camera runs ball tracking only, driven by the main throw label (full-frame scan, then sector follow). Both panels show trajectory overlays. Throw detection is not run on the secondary camera. Trajectories with fewer than `MIN_TRAJECTORY_POINTS` detected positions are discarded so brief GRU flickers do not replace a completed throw. A camera that finishes tracking waits in `awaiting_partner` until the other camera also ends before both return to `detecting_throw`.
+
+Tune via `trajectory_tracking/config.py`: `SECTOR_ANGLE_DEG`, `SECTOR_DIRECTION_DEG`, `SECTOR_RADIUS_PX`, `TRACKING_TIMEOUT_FRAMES`, `MIN_TRAJECTORY_POINTS`, `BALL_CIRCULARITY_MIN/MAX`, `ASSUMED_TORSO_CM`, `TORSO_LENGTH_BUFFER_SIZE`.
 
 ## Configuration
 
@@ -220,6 +241,12 @@ Tune via `trajectory_tracking/config.py`: `SECTOR_ANGLE_DEG`, `SECTOR_RADIUS_PX`
 - **Ball detection:** `DIFF_*`, `MORPH_KERNEL_SIZE`, `BALL_CIRCULARITY_*`, `DETECTION_RECT_THICKNESS`, `FRAME_WINDOW_SIZE`
 - **Pose overlay:** `POSE_JOINT_RADIUS`, `POSE_BONE_THICKNESS`
 - **GRU inference:** `THROW_MODEL_PATH` (latest `throw_detection/models/*.pt`)
+
+**`stereo_viewer/config.py`**
+
+- **Paths:** `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`
+- **Display:** `STEREO_DISPLAY_MAX_SIZE` (reuses `video_viewer` max size; each panel gets half width)
+- **Capture:** `TARGET_FPS` (alias of `TARGET_RECORD_FPS`)
 
 **`pose_detection/config.py`**
 
@@ -237,14 +264,15 @@ Tune via `trajectory_tracking/config.py`: `SECTOR_ANGLE_DEG`, `SECTOR_RADIUS_PX`
 
 **`trajectory_tracking/config.py`**
 
-- **Sector:** `SECTOR_ANGLE_DEG` (full angular width, default 90°), `SECTOR_RADIUS_PX` (max search distance in pixels, default 200)
+- **Sector:** `SECTOR_ANGLE_DEG` (full angular width, default 150°), `SECTOR_DIRECTION_DEG` (sector center direction, default 135° = left tilted 45° downward), `SECTOR_RADIUS_PX` (max search distance in pixels, default 400)
 - **Tracking:** `TRACKING_TIMEOUT_FRAMES` (consecutive miss frames before trajectory is finalised, default 3)
 - **Circularity:** `BALL_CIRCULARITY_MIN / MAX` (same defaults as ball detection: 0.5–1.0)
+- **Minimum length:** `MIN_TRAJECTORY_POINTS` (default 5) — shorter tracks are discarded
 - **Speed:** `ASSUMED_TORSO_CM` (default 50), `TORSO_LENGTH_BUFFER_SIZE` (default 10)
 
 ## Conventions
 
-- Package code lives under `video_viewer/`, `training_recorder/`, `pose_detection/`, and `throw_detection/`; keep detection logic separate from UI.
+- Package code lives under `video_viewer/`, `stereo_viewer/`, `training_recorder/`, `pose_detection/`, and `throw_detection/`; keep detection logic separate from UI.
 - Filters affect preview only unless explicitly designed to process recordings.
 - Use `uv` for dependency changes (`uv add <package>`).
 - Recorded videos and `.pt` model weights are gitignored.
@@ -252,7 +280,6 @@ Tune via `trajectory_tracking/config.py`: `SECTOR_ANGLE_DEG`, `SECTOR_RADIUS_PX`
 
 ## Planned direction (not yet built)
 
-- Dual-camera synchronized recording
 - Ball position fusion across views → 3D trajectory
 - 3D map UI showing historical throws
 

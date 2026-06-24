@@ -11,6 +11,7 @@ wheels/
 
 # Recorded videos
 video_viewer/recordings/
+stereo_viewer/recordings/
 recordings/
 
 # Labelled throw-detection datasets
