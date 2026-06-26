@@ -41,6 +41,12 @@ def find_largest_ball_contour(cleaned: np.ndarray) -> np.ndarray | None:
     return max(valid_ball_contours, key=cv2.contourArea)
 
 
+def contour_bottom_center(contour: np.ndarray) -> tuple[int, int]:
+    """Return the bottom-center of a contour's axis-aligned bounding box."""
+    x, y, width, height = cv2.boundingRect(contour)
+    return (x + width // 2, y + height)
+
+
 def draw_circular_contours(
     frame: np.ndarray,
     contours: list[np.ndarray],

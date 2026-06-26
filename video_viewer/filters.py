@@ -35,9 +35,10 @@ class FilterId(str, Enum):
     GRU_THROW_INFERENCE = "gru_throw_inference"
     TRAJECTORY_TRACKING = "trajectory_tracking"
     STEREO_TRACKING = "stereo_tracking"
+    FRAME_SYNC = "frame_sync"
 
 
-STEREO_ONLY_FILTER_IDS = frozenset({FilterId.STEREO_TRACKING})
+STEREO_ONLY_FILTER_IDS = frozenset({FilterId.STEREO_TRACKING, FilterId.FRAME_SYNC})
 
 FILTER_LABELS: dict[FilterId, str] = {
     FilterId.NONE: "None",
@@ -48,6 +49,7 @@ FILTER_LABELS: dict[FilterId, str] = {
     FilterId.GRU_THROW_INFERENCE: "GRU throw inference",
     FilterId.TRAJECTORY_TRACKING: "Trajectory tracking",
     FilterId.STEREO_TRACKING: "Stereo tracking",
+    FilterId.FRAME_SYNC: "Frame sync",
 }
 
 # Filters that build a motion mask from the video stream.
@@ -57,6 +59,7 @@ BALL_MASK_FILTER_IDS = frozenset(
         FilterId.DETECTION,
         FilterId.TRAJECTORY_TRACKING,
         FilterId.STEREO_TRACKING,
+        FilterId.FRAME_SYNC,
     }
 )
 

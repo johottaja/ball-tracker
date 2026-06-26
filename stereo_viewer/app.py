@@ -34,6 +34,7 @@ from video_viewer.recording import create_writer
 
 from .config import LEFT_VIDEO, RECORDINGS_DIR, RIGHT_VIDEO, STEREO_DISPLAY_MAX_SIZE, TARGET_FPS
 from .display import panel_size_for_frame, stereo_frame_to_photo
+from .frame_sync import FrameSyncProcessor
 from .stereo_tracking import StereoTrackingProcessor
 
 
@@ -80,6 +81,8 @@ class StereoViewerApp:
         self.panel_size = panel_size_for_frame(640, 480, STEREO_DISPLAY_MAX_SIZE)
         self.cameras: list[CameraDevice] = []
         self.stereo_tracking = StereoTrackingProcessor()
+        self.frame_sync = FrameSyncProcessor()
+        self._live_frame_index = 0
 
         self._build_ui()
         self._build_menu()
@@ -194,13 +197,17 @@ class StereoViewerApp:
     def _is_stereo_tracking(self) -> bool:
         return self.filter_controls.selected_filter_id() == FilterId.STEREO_TRACKING
 
+    def _is_frame_sync(self) -> bool:
+        return self.filter_controls.selected_filter_id() == FilterId.FRAME_SYNC
+
     def _on_filter_change(self) -> None:
         filter_id = self.filter_controls.selected_filter_id()
         self.stereo_tracking.reset()
+        self.frame_sync.reset()
         for stream in self._streams():
             stream.gru_stream_frame_index = None
             stream.mog2_stream_frame_index = None
-            if filter_id == FilterId.STEREO_TRACKING:
+            if filter_id in (FilterId.STEREO_TRACKING, FilterId.FRAME_SYNC):
                 stream.frame_filter.set_filter(FilterId.NONE)
             else:
                 stream.frame_filter.set_filter(filter_id)
@@ -210,6 +217,7 @@ class StereoViewerApp:
     def _on_ball_method_change(self) -> None:
         method = self.filter_controls.selected_ball_detection_method()
         self.stereo_tracking.set_ball_detection_method(method)
+        self.frame_sync.set_ball_detection_method(method)
         for stream in self._streams():
             stream.gru_stream_frame_index = None
             stream.mog2_stream_frame_index = None
@@ -272,6 +280,7 @@ class StereoViewerApp:
         self._cancel_after()
         self.playing = False
         self.stereo_tracking.reset()
+        self.frame_sync.reset()
         for stream in self._streams():
             self._release_stream(stream)
 
@@ -375,6 +384,7 @@ class StereoViewerApp:
             return
         self.right.camera_index = index
         self._open_cameras()
+        self._live_frame_index = 0
 
     def _open_cameras(self) -> bool:
         self._cancel_after()
@@ -498,11 +508,40 @@ class StereoViewerApp:
                 or right_id != self.right.preview_frame_id
             )
         ):
+            left_previous = self.left.last_raw_frame
+            right_previous = self.right.last_raw_frame
             self.left.preview_frame_id = left_id
             self.right.preview_frame_id = right_id
             self.left.last_raw_frame = left_frame
             self.right.last_raw_frame = right_frame
-            self._display_stereo_frames(left_frame, right_frame)
+            self._live_frame_index += 1
+
+            left_mog2_warmup = None
+            right_mog2_warmup = None
+            if self._is_frame_sync():
+                method = self.filter_controls.selected_ball_detection_method()
+                if method != BallDetectionMethod.FRAME_DIFF:
+                    left_previous = None
+                    right_previous = None
+
+            self._display_stereo_frames(
+                left_frame,
+                right_frame,
+                frame_index=self._live_frame_index,
+                left_previous=left_previous,
+                right_previous=right_previous,
+                left_mog2_warmup=left_mog2_warmup,
+                right_mog2_warmup=right_mog2_warmup,
+                video_fps=self.record_fps,
+            )
+
+            if (
+                self._is_frame_sync()
+                and self.filter_controls.selected_ball_detection_method()
+                == BallDetectionMethod.MOG2_CLOSING
+            ):
+                self.left.mog2_stream_frame_index = self._live_frame_index
+                self.right.mog2_stream_frame_index = self._live_frame_index
 
         delay = max(1, int(1000 / self.record_fps))
         self.after_id = self.root.after(delay, self._schedule_record_preview)
@@ -617,6 +656,7 @@ class StereoViewerApp:
         left_frame: np.ndarray,
         right_frame: np.ndarray,
         *,
+        frame_index: int = 0,
         left_previous: np.ndarray | None = None,
         right_previous: np.ndarray | None = None,
         left_mog2_warmup: list[np.ndarray] | None = None,
@@ -630,6 +670,17 @@ class StereoViewerApp:
                 left_frame,
                 right_frame,
                 main_warmup_frames=left_warmup,
+                main_previous_frame=left_previous,
+                main_mog2_warmup_frames=left_mog2_warmup,
+                secondary_previous_frame=right_previous,
+                secondary_mog2_warmup_frames=right_mog2_warmup,
+                video_fps=video_fps,
+            )
+        elif self._is_frame_sync():
+            left_filtered, right_filtered = self.frame_sync.apply(
+                left_frame,
+                right_frame,
+                frame_index=frame_index,
                 main_previous_frame=left_previous,
                 main_mog2_warmup_frames=left_mog2_warmup,
                 secondary_previous_frame=right_previous,
@@ -703,6 +754,30 @@ class StereoViewerApp:
                     self.right.mog2_stream_frame_index,
                 )
             right_warmup = None
+        elif self._is_frame_sync():
+            method = self.filter_controls.selected_ball_detection_method()
+            if method == BallDetectionMethod.FRAME_DIFF:
+                left_previous = previous_frame_for_diff(self.left.cap, self.frame_index)
+                right_previous = previous_frame_for_diff(
+                    self.right.cap, self.frame_index
+                )
+                left_mog2_warmup = None
+                right_mog2_warmup = None
+            else:
+                left_previous = None
+                right_previous = None
+                left_mog2_warmup = mog2_warmup_frames_if_needed(
+                    self.left.cap,
+                    self.frame_index,
+                    self.left.mog2_stream_frame_index,
+                )
+                right_mog2_warmup = mog2_warmup_frames_if_needed(
+                    self.right.cap,
+                    self.frame_index,
+                    self.right.mog2_stream_frame_index,
+                )
+            left_warmup = None
+            right_warmup = None
         else:
             left_previous, left_mog2_warmup, left_warmup = filter_inputs_for_playback(
                 self.left.cap,
@@ -722,6 +797,7 @@ class StereoViewerApp:
         self._display_stereo_frames(
             left_frame,
             right_frame,
+            frame_index=self.frame_index,
             left_previous=left_previous,
             right_previous=right_previous,
             left_mog2_warmup=left_mog2_warmup,
@@ -733,6 +809,13 @@ class StereoViewerApp:
 
         if self._is_stereo_tracking():
             self.left.gru_stream_frame_index = self.frame_index
+            if (
+                self.filter_controls.selected_ball_detection_method()
+                == BallDetectionMethod.MOG2_CLOSING
+            ):
+                self.left.mog2_stream_frame_index = self.frame_index
+                self.right.mog2_stream_frame_index = self.frame_index
+        elif self._is_frame_sync():
             if (
                 self.filter_controls.selected_ball_detection_method()
                 == BallDetectionMethod.MOG2_CLOSING
