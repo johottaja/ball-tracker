@@ -10,6 +10,7 @@ import numpy as np
 from .config import (
     BALL_CIRCULARITY_MAX,
     BALL_CIRCULARITY_MIN,
+    BALL_CONTOUR_MIN_AREA,
     MIN_TRAJECTORY_POINTS,
     SECTOR_ANGLE_DEG,
     SECTOR_DIRECTION_DEG,
@@ -333,6 +334,8 @@ class TrajectoryTracker:
 
     def _is_circular(self, contour: np.ndarray) -> bool:
         area = cv2.contourArea(contour)
+        if area < BALL_CONTOUR_MIN_AREA:
+            return False
         perimeter = cv2.arcLength(contour, True)
         if perimeter == 0:
             return False

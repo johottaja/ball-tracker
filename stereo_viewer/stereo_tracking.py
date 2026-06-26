@@ -6,12 +6,12 @@ from throw_detection.inference import ThrowInference
 from trajectory_tracking import Phase, TrajectoryTracker
 from trajectory_tracking.drawing import draw_trajectory_overlay
 from trajectory_tracking.speed import TorsoLengthBuffer, estimate_throw_speed_m_s
+from video_viewer.ball_motion import BallDetectionMethod, MotionMaskBuilder
 from video_viewer.config import THROW_MODEL_PATH
 from video_viewer.filters import (
     _draw_missing_model_banner,
     _extract_torso_length_px,
     _extract_wrist_pos,
-    build_motion_mask,
 )
 from video_viewer.pose_overlay import apply_gru_throw_inference
 
@@ -26,21 +26,25 @@ class StereoTrackingProcessor:
         self._throw_inference: ThrowInference | None = None
         self._main_tracker = TrajectoryTracker()
         self._secondary_tracker = TrajectoryTracker()
-        self._main_prev_frame: np.ndarray | None = None
-        self._secondary_prev_frame: np.ndarray | None = None
+        self._main_motion = MotionMaskBuilder()
+        self._secondary_motion = MotionMaskBuilder()
         self._torso_length_buffer = TorsoLengthBuffer()
         self._main_completed_speed_m_s: float | None = None
         self._secondary_completed_speed_m_s: float | None = None
         self._main_last_completion_id: int = 0
         self._secondary_last_completion_id: int = 0
 
+    def set_ball_detection_method(self, method: BallDetectionMethod) -> None:
+        self._main_motion.set_method(method)
+        self._secondary_motion.set_method(method)
+
     def reset(self) -> None:
         if self._throw_inference is not None:
             self._throw_inference.reset()
         self._main_tracker.reset()
         self._secondary_tracker.reset()
-        self._main_prev_frame = None
-        self._secondary_prev_frame = None
+        self._main_motion.reset()
+        self._secondary_motion.reset()
         self._torso_length_buffer.reset()
         self._main_completed_speed_m_s = None
         self._secondary_completed_speed_m_s = None
@@ -98,7 +102,9 @@ class StereoTrackingProcessor:
         *,
         main_warmup_frames: list[np.ndarray] | None = None,
         main_previous_frame: np.ndarray | None = None,
+        main_mog2_warmup_frames: list[np.ndarray] | None = None,
         secondary_previous_frame: np.ndarray | None = None,
+        secondary_mog2_warmup_frames: list[np.ndarray] | None = None,
         video_fps: float | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         inference = self._ensure_throw_inference()
@@ -106,14 +112,8 @@ class StereoTrackingProcessor:
         if main_warmup_frames is not None:
             self._main_tracker.reset()
             self._secondary_tracker.reset()
-            self._main_prev_frame = (
-                main_previous_frame.copy() if main_previous_frame is not None else None
-            )
-            self._secondary_prev_frame = (
-                secondary_previous_frame.copy()
-                if secondary_previous_frame is not None
-                else None
-            )
+            self._main_motion.reset()
+            self._secondary_motion.reset()
             self._torso_length_buffer.reset()
             self._main_completed_speed_m_s = None
             self._secondary_completed_speed_m_s = None
@@ -126,29 +126,26 @@ class StereoTrackingProcessor:
             main_output = _draw_missing_model_banner(
                 apply_normalized_throw_detection(main_frame)
             )
-            self._main_prev_frame = main_frame.copy()
-            self._secondary_prev_frame = secondary_frame.copy()
+            self._main_motion.build_mask(main_frame, main_previous_frame)
+            self._secondary_motion.build_mask(
+                secondary_frame, secondary_previous_frame
+            )
             return main_output, secondary_frame.copy()
 
         prediction = inference.predict(main_frame, warmup_frames=main_warmup_frames)
         self._torso_length_buffer.add(_extract_torso_length_px(prediction.detection))
         throw_label = prediction.label
 
-        main_prev = (
-            main_previous_frame
-            if main_previous_frame is not None
-            else self._main_prev_frame
+        main_motion_mask = self._main_motion.build_mask(
+            main_frame,
+            main_previous_frame,
+            mog2_warmup_frames=main_mog2_warmup_frames,
         )
-        main_motion_mask = build_motion_mask(main_frame, main_prev)
-        self._main_prev_frame = main_frame.copy()
-
-        secondary_prev = (
-            secondary_previous_frame
-            if secondary_previous_frame is not None
-            else self._secondary_prev_frame
+        secondary_motion_mask = self._secondary_motion.build_mask(
+            secondary_frame,
+            secondary_previous_frame,
+            mog2_warmup_frames=secondary_mog2_warmup_frames,
         )
-        secondary_motion_mask = build_motion_mask(secondary_frame, secondary_prev)
-        self._secondary_prev_frame = secondary_frame.copy()
 
         main_result = self._main_tracker.update(
             throw_label=throw_label,

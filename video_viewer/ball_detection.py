@@ -6,6 +6,7 @@ import numpy as np
 from .config import (
     BALL_CIRCULARITY_MAX,
     BALL_CIRCULARITY_MIN,
+    BALL_CONTOUR_MIN_AREA,
     DETECTION_RECT_THICKNESS,
 )
 
@@ -18,6 +19,8 @@ def _to_gray(cleaned: np.ndarray) -> np.ndarray:
 
 def _is_circular_contour(contour: np.ndarray) -> bool:
     area = cv2.contourArea(contour)
+    if area < BALL_CONTOUR_MIN_AREA:
+        return False
     perimeter = cv2.arcLength(contour, True)
     if perimeter == 0:
         return False

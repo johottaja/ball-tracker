@@ -19,6 +19,7 @@ MIN_TRAJECTORY_POINTS: int = 5
 # Circularity range for contours accepted as ball candidates.
 BALL_CIRCULARITY_MIN: float = 0.5
 BALL_CIRCULARITY_MAX: float = 1.0
+BALL_CONTOUR_MIN_AREA: float = 100.0
 
 # Real-world torso length assumed for pixel-to-distance scaling.
 ASSUMED_TORSO_CM: float = 50.0

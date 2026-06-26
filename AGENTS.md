@@ -10,12 +10,12 @@ Guidance for AI agents working in this repository.
 
 **Current state:** Five Python desktop apps plus shared detection libraries:
 
-- **`video_viewer/`** — record webcam video and inspect it frame by frame. Includes computer-vision filters for debugging and two detection pipelines: **ball detection** (frame diff → threshold → circularity filter) and **throw detection** (YOLOv11 pose overlay via `pose_detection`).
+- **`video_viewer/`** — record webcam video and inspect it frame by frame. Includes configurable **ball detection** (MOG2 + morphological closing, or frame diff → threshold) with contour/circularity filtering, plus **throw detection** (YOLOv11 pose overlay via `pose_detection`).
 - **`stereo_viewer/`** — dual-camera version of the video viewer: side-by-side live preview and playback, same filter set applied independently per camera (plus **Stereo tracking**, stereo-only). Records synchronized `left.mp4` and `right.mp4` under `stereo_viewer/recordings/`.
 - **`pose_detection/`** — reusable YOLO pose pipeline: per-frame dominant-hand selection and batch extraction of arm keypoints from frame sequences.
 - **`training_recorder/`** — lightweight GUI for recording labeled training clips. Enter a training set name; each clip is saved under `recordings/<training_set>/` at the repo root (separate from `video_viewer/recordings/`).
 - **`throw_detection/`** — throw-event labeling GUI, GRU training-data export, GRU training GUI, and streaming GRU inference. Labels per-frame throw/not-throw on clips from `recordings/<set>/`; saves NumPy `.npz` datasets under `throw_detection/training_sets/`; trained models under `throw_detection/models/`.
-- **`trajectory_tracking/`** — stateful ball trajectory tracker that combines throw inference with frame-diff ball detection. Three phases: detecting throw → scanning for ball in a circular sector from the wrist → tracking ball frame-by-frame. Fits a parabola to the collected positions and exposes drawing helpers for the video viewer filter.
+- **`trajectory_tracking/`** — stateful ball trajectory tracker that combines throw inference with configurable ball motion masks. Three phases: detecting throw → scanning for ball in a circular sector from the wrist → tracking ball frame-by-frame. Fits a parabola to the collected positions and exposes drawing helpers for the video viewer filter.
 
 Dual-camera synchronized recording is available via `stereo_viewer`. Stereo triangulation, trajectory reconstruction, and 3D visualization are not implemented yet.
 
@@ -107,10 +107,11 @@ balltracker/
     ├── camera.py             # Webcam open, FPS config, camera probing
     ├── config.py             # Paths and tuning constants
     ├── display.py            # Resize frames for UI display
-    ├── filter_controls.py    # Shared filter combobox + Filters menu widget
-    ├── playback.py           # Shared playback helpers (seek, diff/GRU context, render)
+    ├── filter_controls.py    # Shared filter + ball-detection method comboboxes, Filters menu
+    ├── playback.py           # Shared playback helpers (seek, motion-mask/GRU context, render)
     ├── recording.py          # VideoWriter helper
     ├── filters.py            # Filter registry and FrameFilter pipeline
+    ├── ball_motion.py        # BallDetectionMethod, MotionMaskBuilder (MOG2 / frame diff)
     ├── ball_detection.py     # Contour/circularity logic and ball overlays
     ├── pose_overlay.py       # Dominant-hand skeleton overlay for the viewer filter
     └── recordings/           # Viewer default save dir (gitignored)
@@ -137,11 +138,12 @@ balltracker/
 | `stereo_viewer/stereo_tracking.py` | `StereoTrackingProcessor` — main GRU + ball track on both cameras; secondary ball-only track |
 | **video_viewer** | |
 | `app.py` | `VideoViewerApp` — modes (record/playback), UI, frame stepping, filter wiring |
-| `filter_controls.py` | `FilterControls` — filter combobox + Filters menu (used by both viewers) |
-| `playback.py` | Seek helpers, diff/GRU warmup context, `frame_to_display_photo` |
+| `filter_controls.py` | `FilterControls` — filter combobox, ball-detection method combobox, Filters menu (both viewers) |
+| `playback.py` | Seek helpers, motion-mask/GRU warmup context, `frame_to_display_photo` |
 | `camera.py` | Open cameras (AVFoundation on macOS), probe indices, enforce min FPS; `CameraReader` captures on a background thread |
-| `config.py` | `RECORDINGS_DIR`, ball-detection thresholds, pose overlay drawing sizes |
-| `filters.py` | `FilterId` enum, diff pipeline stages, `FrameFilter` state |
+| `config.py` | `RECORDINGS_DIR`, ball-motion thresholds (MOG2, frame diff), pose overlay drawing sizes |
+| `filters.py` | `FilterId` enum, `FrameFilter` state |
+| `ball_motion.py` | `BallDetectionMethod`, `MotionMaskBuilder` — MOG2 + closing or frame diff masks |
 | `ball_detection.py` | Circular contour filtering, largest-ball selection, drawing |
 | `pose_overlay.py` | Throw / normalized-throw / GRU-inference filter overlays (imports `pose_detection`, `throw_detection.inference`) |
 | `recording.py` | Create MP4 writer at `recordings/recording.mp4` |
@@ -163,18 +165,24 @@ balltracker/
 | `drawing.py` | `draw_trajectory_overlay` — sector wedge, ball markers, active/completed points, fitted parabola, phase label, completed throw speed (top-right) |
 | `config.py` | `SECTOR_ANGLE_DEG`, `SECTOR_DIRECTION_DEG`, `SECTOR_RADIUS_PX`, `TRACKING_TIMEOUT_FRAMES`, `BALL_CIRCULARITY_MIN/MAX`, `ASSUMED_TORSO_CM`, `TORSO_LENGTH_BUFFER_SIZE` |
 
-## Filter pipeline (ball detection)
+## Ball detection
+
+Both viewers expose a **Ball detection** dropdown (independent of the display filter). The selected method builds a binary motion mask used by **Contours**, **Ball detection**, **Trajectory tracking**, and **Stereo tracking**.
+
+**MOG2 + morphological closing (default):** `cv2.createBackgroundSubtractorMOG2` foreground mask, then morphological close (dilation + erosion). On playback seeks, prior frames up to `MOG2_HISTORY` are fed through the subtractor before the current frame.
+
+**Frame diff:** `current − previous`, brightness amplification (`DIFF_BRIGHTNESS_FACTOR`), threshold (`DIFF_THRESH_VALUE`), morphological open (`FRAME_DIFF_MORPH_KERNEL_SIZE`). Needs the previous frame (or sequential streaming state).
+
+Shared contour step (both methods):
+
+1. **Contour detection** — external contours on the binary mask
+2. **Circularity filter** — reject non-ball shapes via `BALL_CIRCULARITY_MIN/MAX`
+3. **Minimum area** — reject contours smaller than `BALL_CONTOUR_MIN_AREA` px²
+4. **Largest contour** — treated as the ball
+
+**Contours** filter draws all circular contours on the mask. **Ball detection** draws a red bounding rectangle on the original frame.
 
 Filters are display-only; recordings save raw camera frames.
-
-1. **Frame difference** — `current − previous` (or mean of last N frames for window diff)
-2. **Brightness amplification** — `DIFF_BRIGHTNESS_FACTOR`
-3. **Threshold + morphological open** — `DIFF_THRESH_VALUE`, `MORPH_KERNEL_SIZE`
-4. **Contour detection** — external contours on binary mask
-5. **Circularity filter** — reject non-ball shapes via `BALL_CIRCULARITY_MIN/MAX`
-6. **Largest contour** — treated as the ball; red rectangle on original frame
-
-Intermediate diff filters exist for debugging each step. Ball detection needs a valid previous frame (first frame after seek shows nothing).
 
 ## Pose / throw detection
 
@@ -215,7 +223,7 @@ The video viewer **GRU throw inference** filter (`FilterId.GRU_THROW_INFERENCE`)
 `TrajectoryTracker` is a three-phase state machine called once per frame:
 
 1. **DETECTING_THROW** — waits for `throw_label == 1` from the GRU inference. When detected, moves to phase 2 using the wrist position as the sector origin.
-2. **SCANNING_BALL** — on every frame, re-anchors the sector at the wrist if the throw label is still 1. Searches the motion mask (frame-diff threshold) for the largest circular contour whose centroid lies inside a circular sector: `sector_radius` pixels from the wrist, centered on the elbow→wrist arm direction, ±`sector_half_angle` degrees wide. When a contour is found, transitions to phase 3.
+2. **SCANNING_BALL** — on every frame, re-anchors the sector at the wrist if the throw label is still 1. Searches the motion mask for the largest circular contour whose centroid lies inside a circular sector: `sector_radius` pixels from the wrist, centered on the elbow→wrist arm direction, ±`sector_half_angle` degrees wide. When a contour is found, transitions to phase 3.
 3. **TRACKING_BALL** — records ball centroid positions. Each frame the sector is re-centered on the last detection and the direction is updated to the previous→current ball vector. If `timeout_frames` consecutive frames yield no detection, the trajectory is finalised: `numpy.polyfit` fits a degree-2 polynomial (y=f(x) or x=f(y) depending on aspect ratio) and 120 sampled curve points are stored. The tracker then returns to phase 1.
 
 A new throw label while in phase 3 immediately finalises the current trajectory and re-enters phase 2.
@@ -238,7 +246,7 @@ Tune via `trajectory_tracking/config.py`: `SECTOR_ANGLE_DEG`, `SECTOR_DIRECTION_
 
 - **Paths:** `RECORDINGS_DIR`, `DEFAULT_VIDEO`
 - **Capture:** `TARGET_RECORD_FPS`, `MAX_CAMERA_PROBE`, `DISPLAY_MAX_SIZE`
-- **Ball detection:** `DIFF_*`, `MORPH_KERNEL_SIZE`, `BALL_CIRCULARITY_*`, `DETECTION_RECT_THICKNESS`, `FRAME_WINDOW_SIZE`
+- **Ball motion:** `DIFF_*`, `FRAME_DIFF_MORPH_KERNEL_SIZE`, `MOG2_*`, `BALL_CIRCULARITY_*`, `BALL_CONTOUR_MIN_AREA`, `DETECTION_RECT_THICKNESS`
 - **Pose overlay:** `POSE_JOINT_RADIUS`, `POSE_BONE_THICKNESS`
 - **GRU inference:** `THROW_MODEL_PATH` (latest `throw_detection/models/*.pt`)
 
@@ -267,6 +275,7 @@ Tune via `trajectory_tracking/config.py`: `SECTOR_ANGLE_DEG`, `SECTOR_DIRECTION_
 - **Sector:** `SECTOR_ANGLE_DEG` (full angular width, default 150°), `SECTOR_DIRECTION_DEG` (sector center direction, default 135° = left tilted 45° downward), `SECTOR_RADIUS_PX` (max search distance in pixels, default 400)
 - **Tracking:** `TRACKING_TIMEOUT_FRAMES` (consecutive miss frames before trajectory is finalised, default 3)
 - **Circularity:** `BALL_CIRCULARITY_MIN / MAX` (same defaults as ball detection: 0.5–1.0)
+- **Minimum area:** `BALL_CONTOUR_MIN_AREA` (default 100 px²)
 - **Minimum length:** `MIN_TRAJECTORY_POINTS` (default 5) — shorter tracks are discarded
 - **Speed:** `ASSUMED_TORSO_CM` (default 50), `TORSO_LENGTH_BUFFER_SIZE` (default 10)
 

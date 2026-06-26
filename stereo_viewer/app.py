@@ -15,15 +15,20 @@ from video_viewer.camera import (
     open_camera,
     probe_cameras,
 )
+from video_viewer.ball_motion import BallDetectionMethod
 from video_viewer.filter_controls import FilterControls
 from video_viewer.filters import FrameFilter
 from video_viewer.filters import FilterId
 from video_viewer.playback import (
     filter_inputs_for_playback,
     gru_warmup_frames_if_needed,
+    mog2_warmup_frames,
+    mog2_warmup_frames_if_needed,
     previous_frame_for_diff,
     read_frame_at,
+    step_index_by_seconds,
     uses_gru_streaming,
+    uses_mog2_streaming,
 )
 from video_viewer.recording import create_writer
 
@@ -42,6 +47,7 @@ class CameraStream:
     writer: cv2.VideoWriter | None = None
     frame_filter: FrameFilter = field(default_factory=FrameFilter)
     gru_stream_frame_index: int | None = None
+    mog2_stream_frame_index: int | None = None
     last_raw_frame: np.ndarray | None = None
     preview_frame_id: int = 0
     video_path: Path | None = None
@@ -77,6 +83,7 @@ class StereoViewerApp:
 
         self._build_ui()
         self._build_menu()
+        self._bind_playback_keys()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._enter_record_mode()
 
@@ -107,6 +114,7 @@ class StereoViewerApp:
         self.filter_controls = FilterControls(
             self.root,
             on_change=self._on_filter_change,
+            on_ball_method_change=self._on_ball_method_change,
             include_stereo=True,
         )
 
@@ -164,16 +172,16 @@ class StereoViewerApp:
         ttk.Button(btn_row, text="|◀ Beginning", command=self._go_to_start).pack(
             side=tk.LEFT, padx=2
         )
-        ttk.Button(btn_row, text="◀ Frame", command=self._step_backward).pack(
-            side=tk.LEFT, padx=2
-        )
+        step_back_btn = ttk.Button(btn_row, text="◀ Frame")
+        step_back_btn.pack(side=tk.LEFT, padx=2)
+        step_back_btn.bind("<Button-1>", self._on_step_backward_click)
         ttk.Button(btn_row, text="Play", command=self._play).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_row, text="Pause", command=self._pause).pack(
             side=tk.LEFT, padx=2
         )
-        ttk.Button(btn_row, text="Frame ▶", command=self._step_forward).pack(
-            side=tk.LEFT, padx=2
-        )
+        step_forward_btn = ttk.Button(btn_row, text="Frame ▶")
+        step_forward_btn.pack(side=tk.LEFT, padx=2)
+        step_forward_btn.bind("<Button-1>", self._on_step_forward_click)
 
     def _build_menu(self) -> None:
         menubar = tk.Menu(self.root)
@@ -191,10 +199,21 @@ class StereoViewerApp:
         self.stereo_tracking.reset()
         for stream in self._streams():
             stream.gru_stream_frame_index = None
+            stream.mog2_stream_frame_index = None
             if filter_id == FilterId.STEREO_TRACKING:
                 stream.frame_filter.set_filter(FilterId.NONE)
             else:
                 stream.frame_filter.set_filter(filter_id)
+        self.filter_controls.sync_combo_from_var()
+        self._refresh_visible_frame()
+
+    def _on_ball_method_change(self) -> None:
+        method = self.filter_controls.selected_ball_detection_method()
+        self.stereo_tracking.set_ball_detection_method(method)
+        for stream in self._streams():
+            stream.gru_stream_frame_index = None
+            stream.mog2_stream_frame_index = None
+            stream.frame_filter.set_ball_detection_method(method)
         self.filter_controls.sync_combo_from_var()
         self._refresh_visible_frame()
 
@@ -235,6 +254,7 @@ class StereoViewerApp:
 
     def _release_stream(self, stream: CameraStream) -> None:
         stream.gru_stream_frame_index = None
+        stream.mog2_stream_frame_index = None
         stream.frame_filter.reset()
         if stream.writer is not None:
             stream.writer.release()
@@ -580,14 +600,14 @@ class StereoViewerApp:
         frame: np.ndarray,
         *,
         previous_frame: np.ndarray | None = None,
-        window_frames: list[np.ndarray] | None = None,
+        mog2_warmup_frames: list[np.ndarray] | None = None,
         warmup_frames: list[np.ndarray] | None = None,
         video_fps: float | None = None,
     ) -> np.ndarray:
         return stream.frame_filter.apply(
             frame,
             previous_frame=previous_frame,
-            window_frames=window_frames,
+            mog2_warmup_frames=mog2_warmup_frames,
             warmup_frames=warmup_frames,
             video_fps=video_fps,
         )
@@ -599,8 +619,8 @@ class StereoViewerApp:
         *,
         left_previous: np.ndarray | None = None,
         right_previous: np.ndarray | None = None,
-        left_window: list[np.ndarray] | None = None,
-        right_window: list[np.ndarray] | None = None,
+        left_mog2_warmup: list[np.ndarray] | None = None,
+        right_mog2_warmup: list[np.ndarray] | None = None,
         left_warmup: list[np.ndarray] | None = None,
         right_warmup: list[np.ndarray] | None = None,
         video_fps: float | None = None,
@@ -611,7 +631,9 @@ class StereoViewerApp:
                 right_frame,
                 main_warmup_frames=left_warmup,
                 main_previous_frame=left_previous,
+                main_mog2_warmup_frames=left_mog2_warmup,
                 secondary_previous_frame=right_previous,
+                secondary_mog2_warmup_frames=right_mog2_warmup,
                 video_fps=video_fps,
             )
         else:
@@ -619,7 +641,7 @@ class StereoViewerApp:
                 self.left,
                 left_frame,
                 previous_frame=left_previous,
-                window_frames=left_window,
+                mog2_warmup_frames=left_mog2_warmup,
                 warmup_frames=left_warmup,
                 video_fps=video_fps,
             )
@@ -627,7 +649,7 @@ class StereoViewerApp:
                 self.right,
                 right_frame,
                 previous_frame=right_previous,
-                window_frames=right_window,
+                mog2_warmup_frames=right_mog2_warmup,
                 warmup_frames=right_warmup,
                 video_fps=video_fps,
             )
@@ -659,23 +681,42 @@ class StereoViewerApp:
                 self.left.gru_stream_frame_index,
                 self.stereo_tracking.throw_buffer_size(),
             )
-            right_previous = previous_frame_for_diff(self.right.cap, self.frame_index)
-            left_previous = previous_frame_for_diff(self.left.cap, self.frame_index)
-            left_window = None
-            right_window = None
+            method = self.filter_controls.selected_ball_detection_method()
+            if method == BallDetectionMethod.FRAME_DIFF:
+                left_previous = previous_frame_for_diff(self.left.cap, self.frame_index)
+                right_previous = previous_frame_for_diff(
+                    self.right.cap, self.frame_index
+                )
+                left_mog2_warmup = None
+                right_mog2_warmup = None
+            else:
+                left_previous = None
+                right_previous = None
+                left_mog2_warmup = mog2_warmup_frames_if_needed(
+                    self.left.cap,
+                    self.frame_index,
+                    self.left.mog2_stream_frame_index,
+                )
+                right_mog2_warmup = mog2_warmup_frames_if_needed(
+                    self.right.cap,
+                    self.frame_index,
+                    self.right.mog2_stream_frame_index,
+                )
             right_warmup = None
         else:
-            left_previous, left_window, left_warmup = filter_inputs_for_playback(
+            left_previous, left_mog2_warmup, left_warmup = filter_inputs_for_playback(
                 self.left.cap,
                 self.left.frame_filter,
                 self.frame_index,
                 self.left.gru_stream_frame_index,
+                self.left.mog2_stream_frame_index,
             )
-            right_previous, right_window, right_warmup = filter_inputs_for_playback(
+            right_previous, right_mog2_warmup, right_warmup = filter_inputs_for_playback(
                 self.right.cap,
                 self.right.frame_filter,
                 self.frame_index,
                 self.right.gru_stream_frame_index,
+                self.right.mog2_stream_frame_index,
             )
 
         self._display_stereo_frames(
@@ -683,8 +724,8 @@ class StereoViewerApp:
             right_frame,
             left_previous=left_previous,
             right_previous=right_previous,
-            left_window=left_window,
-            right_window=right_window,
+            left_mog2_warmup=left_mog2_warmup,
+            right_mog2_warmup=right_mog2_warmup,
             left_warmup=left_warmup,
             right_warmup=right_warmup,
             video_fps=video_fps,
@@ -692,11 +733,21 @@ class StereoViewerApp:
 
         if self._is_stereo_tracking():
             self.left.gru_stream_frame_index = self.frame_index
+            if (
+                self.filter_controls.selected_ball_detection_method()
+                == BallDetectionMethod.MOG2_CLOSING
+            ):
+                self.left.mog2_stream_frame_index = self.frame_index
+                self.right.mog2_stream_frame_index = self.frame_index
         else:
             if uses_gru_streaming(self.left.frame_filter):
                 self.left.gru_stream_frame_index = self.frame_index
             if uses_gru_streaming(self.right.frame_filter):
                 self.right.gru_stream_frame_index = self.frame_index
+            if uses_mog2_streaming(self.left.frame_filter):
+                self.left.mog2_stream_frame_index = self.frame_index
+            if uses_mog2_streaming(self.right.frame_filter):
+                self.right.mog2_stream_frame_index = self.frame_index
 
         self._update_status()
         return True
@@ -711,6 +762,40 @@ class StereoViewerApp:
             f"({time_s:.2f}s @ {self.fps:.1f} fps)"
         )
 
+    def _bind_playback_keys(self) -> None:
+        bindings = {
+            "<Left>": self._step_backward,
+            "<Right>": self._step_forward,
+            "<Shift-Left>": self._skip_backward,
+            "<Shift-Right>": self._skip_forward,
+            "<Up>": self._play,
+            "<Down>": self._pause,
+        }
+        for sequence, handler in bindings.items():
+            self.root.bind_all(
+                sequence,
+                lambda _e, handler=handler: self._playback_key_handler(handler),
+            )
+        self.root.focus_set()
+
+    def _playback_key_handler(self, handler) -> str:
+        handler()
+        return "break"
+
+    def _on_step_backward_click(self, event: tk.Event) -> str:
+        if event.state & 0x1:
+            self._skip_backward()
+        else:
+            self._step_backward()
+        return "break"
+
+    def _on_step_forward_click(self, event: tk.Event) -> str:
+        if event.state & 0x1:
+            self._skip_forward()
+        else:
+            self._step_forward()
+        return "break"
+
     def _go_to_start(self) -> None:
         self._pause()
         self._show_frame_at(0)
@@ -722,6 +807,30 @@ class StereoViewerApp:
     def _step_forward(self) -> None:
         self._pause()
         self._show_frame_at(self.frame_index + 1)
+
+    def _skip_backward(self) -> None:
+        self._pause()
+        self._show_frame_at(
+            step_index_by_seconds(
+                self.frame_index,
+                self.fps,
+                1.0,
+                forward=False,
+                frame_count=self.frame_count,
+            )
+        )
+
+    def _skip_forward(self) -> None:
+        self._pause()
+        self._show_frame_at(
+            step_index_by_seconds(
+                self.frame_index,
+                self.fps,
+                1.0,
+                forward=True,
+                frame_count=self.frame_count,
+            )
+        )
 
     def _play(self) -> None:
         if not self._both_caps_open() or self.mode.get() != "playback":

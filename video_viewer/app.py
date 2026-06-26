@@ -16,7 +16,9 @@ from .playback import (
     filter_inputs_for_playback,
     frame_to_display_photo,
     read_frame_at,
+    step_index_by_seconds,
     uses_gru_streaming,
+    uses_mog2_streaming,
 )
 from .recording import create_writer
 
@@ -50,9 +52,11 @@ class VideoViewerApp:
         self.frame_filter = FrameFilter()
         self._last_raw_frame: np.ndarray | None = None
         self._gru_stream_frame_index: int | None = None
+        self._mog2_stream_frame_index: int | None = None
 
         self._build_ui()
         self._build_menu()
+        self._bind_playback_keys()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._enter_record_mode()
 
@@ -83,6 +87,7 @@ class VideoViewerApp:
         self.filter_controls = FilterControls(
             self.root,
             on_change=self._on_filter_change,
+            on_ball_method_change=self._on_ball_method_change,
         )
 
         self.video_label = ttk.Label(self.root, text="No video", anchor=tk.CENTER)
@@ -125,16 +130,16 @@ class VideoViewerApp:
         ttk.Button(btn_row, text="|◀ Beginning", command=self._go_to_start).pack(
             side=tk.LEFT, padx=2
         )
-        ttk.Button(btn_row, text="◀ Frame", command=self._step_backward).pack(
-            side=tk.LEFT, padx=2
-        )
+        step_back_btn = ttk.Button(btn_row, text="◀ Frame")
+        step_back_btn.pack(side=tk.LEFT, padx=2)
+        step_back_btn.bind("<Button-1>", self._on_step_backward_click)
         ttk.Button(btn_row, text="Play", command=self._play).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_row, text="Pause", command=self._pause).pack(
             side=tk.LEFT, padx=2
         )
-        ttk.Button(btn_row, text="Frame ▶", command=self._step_forward).pack(
-            side=tk.LEFT, padx=2
-        )
+        step_forward_btn = ttk.Button(btn_row, text="Frame ▶")
+        step_forward_btn.pack(side=tk.LEFT, padx=2)
+        step_forward_btn.bind("<Button-1>", self._on_step_forward_click)
 
     def _build_menu(self) -> None:
         menubar = tk.Menu(self.root)
@@ -143,7 +148,17 @@ class VideoViewerApp:
 
     def _on_filter_change(self) -> None:
         self._gru_stream_frame_index = None
+        self._mog2_stream_frame_index = None
         self.frame_filter.set_filter(self.filter_controls.selected_filter_id())
+        self.filter_controls.sync_combo_from_var()
+        self._refresh_visible_frame()
+
+    def _on_ball_method_change(self) -> None:
+        self._gru_stream_frame_index = None
+        self._mog2_stream_frame_index = None
+        self.frame_filter.set_ball_detection_method(
+            self.filter_controls.selected_ball_detection_method()
+        )
         self.filter_controls.sync_combo_from_var()
         self._refresh_visible_frame()
 
@@ -169,6 +184,7 @@ class VideoViewerApp:
     def _release_capture(self) -> None:
         self._cancel_after()
         self._gru_stream_frame_index = None
+        self._mog2_stream_frame_index = None
         self.frame_filter.reset()
         self.playing = False
         if self.writer is not None:
@@ -393,21 +409,24 @@ class VideoViewerApp:
         if self.frame_index < 0:
             self.frame_index = index
 
-        previous, window_frames, warmup_frames = filter_inputs_for_playback(
+        previous, mog2_warmup, warmup_frames = filter_inputs_for_playback(
             self.cap,
             self.frame_filter,
             self.frame_index,
             self._gru_stream_frame_index,
+            self._mog2_stream_frame_index,
         )
 
         self._display_frame(
             frame,
             previous_frame=previous,
-            window_frames=window_frames,
+            mog2_warmup_frames=mog2_warmup,
             warmup_frames=warmup_frames,
         )
         if uses_gru_streaming(self.frame_filter):
             self._gru_stream_frame_index = self.frame_index
+        if uses_mog2_streaming(self.frame_filter):
+            self._mog2_stream_frame_index = self.frame_index
         self._update_status()
         return True
 
@@ -416,7 +435,7 @@ class VideoViewerApp:
         frame: np.ndarray,
         *,
         previous_frame: np.ndarray | None = None,
-        window_frames: list[np.ndarray] | None = None,
+        mog2_warmup_frames: list[np.ndarray] | None = None,
         warmup_frames: list[np.ndarray] | None = None,
     ) -> None:
         video_fps = self.fps if self.mode.get() == "playback" else None
@@ -425,7 +444,7 @@ class VideoViewerApp:
             frame,
             self.display_size,
             previous_frame=previous_frame,
-            window_frames=window_frames,
+            mog2_warmup_frames=mog2_warmup_frames,
             warmup_frames=warmup_frames,
             video_fps=video_fps,
         )
@@ -440,6 +459,40 @@ class VideoViewerApp:
             f"({time_s:.2f}s @ {self.fps:.1f} fps)"
         )
 
+    def _bind_playback_keys(self) -> None:
+        bindings = {
+            "<Left>": self._step_backward,
+            "<Right>": self._step_forward,
+            "<Shift-Left>": self._skip_backward,
+            "<Shift-Right>": self._skip_forward,
+            "<Up>": self._play,
+            "<Down>": self._pause,
+        }
+        for sequence, handler in bindings.items():
+            self.root.bind_all(
+                sequence,
+                lambda _e, handler=handler: self._playback_key_handler(handler),
+            )
+        self.root.focus_set()
+
+    def _playback_key_handler(self, handler) -> str:
+        handler()
+        return "break"
+
+    def _on_step_backward_click(self, event: tk.Event) -> str:
+        if event.state & 0x1:
+            self._skip_backward()
+        else:
+            self._step_backward()
+        return "break"
+
+    def _on_step_forward_click(self, event: tk.Event) -> str:
+        if event.state & 0x1:
+            self._skip_forward()
+        else:
+            self._step_forward()
+        return "break"
+
     def _go_to_start(self) -> None:
         self._pause()
         self._show_frame_at(0)
@@ -451,6 +504,30 @@ class VideoViewerApp:
     def _step_forward(self) -> None:
         self._pause()
         self._show_frame_at(self.frame_index + 1)
+
+    def _skip_backward(self) -> None:
+        self._pause()
+        self._show_frame_at(
+            step_index_by_seconds(
+                self.frame_index,
+                self.fps,
+                1.0,
+                forward=False,
+                frame_count=self.frame_count,
+            )
+        )
+
+    def _skip_forward(self) -> None:
+        self._pause()
+        self._show_frame_at(
+            step_index_by_seconds(
+                self.frame_index,
+                self.fps,
+                1.0,
+                forward=True,
+                frame_count=self.frame_count,
+            )
+        )
 
     def _play(self) -> None:
         if self.cap is None or self.mode.get() != "playback":
