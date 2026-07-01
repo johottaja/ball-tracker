@@ -191,6 +191,7 @@ class StereoTrackingProcessor:
             self._main_tracker._sector_half_angle,
             self._main_tracker.sector_radius,
             speed_m_s=self._main_completed_speed_m_s,
+            large_phase_label=True,
         )
         secondary_output = draw_trajectory_overlay(
             secondary_frame,
@@ -198,5 +199,6 @@ class StereoTrackingProcessor:
             self._secondary_tracker._sector_half_angle,
             self._secondary_tracker.sector_radius,
             speed_m_s=self._secondary_completed_speed_m_s,
+            large_phase_label=True,
         )
         return main_output, secondary_output

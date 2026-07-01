@@ -42,13 +42,7 @@ def configure_camera_fps(cap: cv2.VideoCapture) -> float:
     """Request target fps from the device; ignore under-reported rates (common on macOS)."""
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap.set(cv2.CAP_PROP_FPS, TARGET_RECORD_FPS)
-    reported = cap.get(cv2.CAP_PROP_FPS)
-    print(f"Reported FPS: {reported}")
-    if reported is None or reported <= 1:
-        print("Using default FPS")
-        return TARGET_RECORD_FPS
-    print(f"Using reported FPS: {reported}")
-    return max(TARGET_RECORD_FPS, reported)
+    return TARGET_RECORD_FPS
 
 
 def _darwin_camera_names() -> dict[int, str]:
@@ -183,7 +177,11 @@ class CameraReader:
 
             frame_copy = frame.copy()
             with self._lock:
-                if self._consumer is not None:
-                    self._consumer(frame_copy)
+                consumer = self._consumer
+
+            if consumer is not None:
+                consumer(frame_copy)
+
+            with self._lock:
                 self._latest_frame = frame_copy
                 self._frame_id += 1

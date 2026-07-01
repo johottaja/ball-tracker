@@ -8,17 +8,18 @@ Guidance for AI agents working in this repository.
 
 **balltracker** is a beer pong throw tracker. The long-term goal is to record a table from two cameras at different angles, track each ball’s trajectory through the throw, and display all throws on a 3D map.
 
-**Current state:** Five Python desktop apps plus shared detection libraries:
+**Current state:** Six Python desktop apps plus shared detection libraries:
 
 - **`video_viewer/`** — record webcam video and inspect it frame by frame. Includes configurable **ball detection** (MOG2 + morphological closing, or frame diff → threshold) with contour/circularity filtering, plus **throw detection** (YOLOv11 pose overlay via `pose_detection`).
-- **`stereo_viewer/`** — dual-camera version of the video viewer: side-by-side live preview and playback, same filter set applied independently per camera (plus **Stereo tracking** and **Frame sync**, stereo-only). Records synchronized `left.mp4` and `right.mp4` under `stereo_viewer/recordings/`.
+- **`stereo_viewer/`** — dual-camera version of the video viewer: side-by-side live preview and playback, same filter set applied independently per camera (plus **Stereo tracking** and **Frame sync**, stereo-only). Records `left.mp4` and `right.mp4` under `stereo_viewer/recordings/`; on stop, the shorter clip is re-encoded with frames duplicated evenly throughout so both files have the same frame count.
+- **`game_tracker/`** — production dual-camera app for recording a full beer pong game. No debug filters; always runs stereo throw + ball tracking, triangulates 3D trajectories from configurable camera geometry, and saves throws to `game_tracker/recordings/game.json` for a future React SPA. Records `left.mp4` / `right.mp4` under `game_tracker/recordings/` with the same frame-count equalization on stop as `stereo_viewer`.
 - **`pose_detection/`** — reusable YOLO pose pipeline: per-frame dominant-hand selection and batch extraction of arm keypoints from frame sequences.
 - **`training_recorder/`** — lightweight GUI for recording labeled training clips. Enter a training set name; each clip is saved under `recordings/<training_set>/` at the repo root (separate from `video_viewer/recordings/`).
 - **`throw_detection/`** — throw-event labeling GUI, GRU training-data export, GRU training GUI, and streaming GRU inference. Labels per-frame throw/not-throw on clips from `recordings/<set>/`; saves NumPy `.npz` datasets under `throw_detection/training_sets/`; trained models under `throw_detection/models/`.
 - **`trajectory_tracking/`** — stateful ball trajectory tracker that combines throw inference with configurable ball motion masks. Three phases: detecting throw → scanning for ball in a circular sector from the wrist → tracking ball frame-by-frame. Fits a parabola to the collected positions and exposes drawing helpers for the video viewer filter.
 - **`framesync/`** — stereo camera frame-offset measurement from deliberate straight-down ball drops and table bounces. Per-camera macro phase machine plus subframe bounce-time estimation; reused by the stereo viewer **Frame sync** filter.
 
-Dual-camera synchronized recording is available via `stereo_viewer`. Stereo triangulation, trajectory reconstruction, and 3D visualization are not implemented yet.
+Dual-camera synchronized recording is available via `stereo_viewer` and `game_tracker`. Stereo 3D triangulation and JSON export are implemented in `game_tracker`; a React 3D map UI is not built yet.
 
 ## Tech stack
 
@@ -35,6 +36,7 @@ Dual-camera synchronized recording is available via `stereo_viewer`. Stereo tria
 uv sync
 uv run python -m video_viewer
 uv run python -m stereo_viewer
+uv run python -m game_tracker
 uv run python -m training_recorder
 uv run python -m throw_detection.labeller <set_name>
 uv run python -m throw_detection.trainer
@@ -42,7 +44,7 @@ uv run python -m throw_detection.trainer
 
 Alternative entry: `uv run python video_viewer/viewer.py`
 
-`main.py` at the repo root is a placeholder; use `video_viewer`, `stereo_viewer`, `training_recorder`, `throw_detection.labeller`, or `throw_detection.trainer` to run an app.
+`main.py` at the repo root is a placeholder; use `video_viewer`, `stereo_viewer`, `game_tracker`, `training_recorder`, `throw_detection.labeller`, or `throw_detection.trainer` to run an app.
 
 ## Project structure
 
@@ -109,6 +111,19 @@ balltracker/
 │   ├── stereo_tracking.py    # Stereo tracking filter: main GRU + secondary ball trajectory
 │   ├── frame_sync.py         # Frame sync filter: FrameSyncProcessor wrapper
 │   └── recordings/           # Default left.mp4 / right.mp4 (gitignored)
+├── game_tracker/             # Production game recorder + 3D throw tracking
+│   ├── __init__.py
+│   ├── __main__.py           # `python -m game_tracker` entry
+│   ├── app.py                # GameTrackerApp — record/playback, ball method, camera setup
+│   ├── config.py             # Paths, default geometry, triangulation thresholds
+│   ├── display.py            # Re-exports stereo_viewer display helpers
+│   ├── setup_config.py       # CameraSetup dataclass + load/save camera_setup.json
+│   ├── setup_dialog.py       # Camera geometry popup
+│   ├── processor.py          # GameTrackingProcessor — stereo tracking + JSON export
+│   ├── triangulation.py      # Camera poses, cv2.triangulatePoints, 3D curve fit
+│   ├── game_data.py          # GameSession / ThrowRecord JSON schema
+│   ├── camera_setup.json     # Persisted geometry (optional, runtime)
+│   └── recordings/           # left.mp4, right.mp4, game.json (gitignored)
 └── video_viewer/             # Viewer and CV debugging app
     ├── __init__.py
     ├── __main__.py           # `python -m video_viewer` entry
@@ -119,6 +134,7 @@ balltracker/
     ├── display.py            # Resize frames for UI display
     ├── filter_controls.py    # Shared filter + ball-detection method comboboxes, Filters menu
     ├── playback.py           # Shared playback helpers (seek, motion-mask/GRU context, render)
+    ├── prefetch.py           # 1-frame playback lookahead (worker thread + filter state sync)
     ├── recording.py          # VideoWriter helper
     ├── filters.py            # Filter registry and FrameFilter pipeline
     ├── ball_motion.py        # BallDetectionMethod, MotionMaskBuilder (MOG2 / frame diff)
@@ -142,22 +158,30 @@ balltracker/
 | `types.py` | `Joint`, `DominantHand`, `DominantHandSequence` |
 | `config.py` | `POSE_MODEL_PATH`, `POSE_DEVICE`, `POSE_CONF_THRESHOLD`, `POSE_KEYPOINT_MIN_CONF` |
 | **stereo_viewer** | |
-| `stereo_viewer/app.py` | `StereoViewerApp` — two camera streams, side-by-side preview/playback, independent `FrameFilter` per camera (or coordinated **Stereo tracking**) |
+| `stereo_viewer/app.py` | `StereoViewerApp` — two camera streams, side-by-side preview/playback, independent `FrameFilter` per camera (or coordinated **Stereo tracking**); equalizes frame counts on record stop |
 | `stereo_viewer/config.py` | `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `STEREO_DISPLAY_MAX_SIZE` |
 | `stereo_viewer/display.py` | `panel_size_for_frame`, `stereo_frame_to_photo` (horizontal composite) |
 | `stereo_viewer/stereo_tracking.py` | `StereoTrackingProcessor` — main GRU + ball track on both cameras; secondary ball-only track |
 | `stereo_viewer/frame_sync.py` | `FrameSyncProcessor` — ball drop/bounce sync on both cameras via `FrameSyncEngine` |
+| **game_tracker** | |
+| `game_tracker/app.py` | `GameTrackerApp` — dual-camera record/playback, ball-detection method, camera setup popup; always-on `GameTrackingProcessor` |
+| `game_tracker/config.py` | `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `GAME_JSON`, `SETUP_JSON`, default geometry |
+| `game_tracker/setup_config.py` | `CameraSetup` dataclass; load/save `camera_setup.json` on startup / dialog save / app close |
+| `game_tracker/processor.py` | `GameTrackingProcessor` — stereo GRU + ball tracking, frame-indexed 2D capture, triangulation, incremental `game.json` writes |
+| `game_tracker/triangulation.py` | Look-at camera poses from setup; `cv2.triangulatePoints`; quadratic 3D curve fit; speed from 3D arc length |
+| `game_tracker/game_data.py` | `GameSession`, `ThrowRecord`, JSON save/load (atomic temp + rename) |
 | **video_viewer** | |
 | `app.py` | `VideoViewerApp` — modes (record/playback), UI, frame stepping, filter wiring |
 | `filter_controls.py` | `FilterControls` — filter combobox, ball-detection method combobox, Filters menu (both viewers) |
 | `playback.py` | Seek helpers, motion-mask/GRU warmup context, `frame_to_display_photo` |
+| `prefetch.py` | `PlaybackPrefetcher` — background filter apply for next frame during forward play |
 | `camera.py` | Open cameras (AVFoundation on macOS), probe indices, enforce min FPS; `CameraReader` captures on a background thread |
 | `config.py` | `RECORDINGS_DIR`, ball-motion thresholds (MOG2, frame diff), pose overlay drawing sizes |
 | `filters.py` | `FilterId` enum, `FrameFilter` state |
 | `ball_motion.py` | `BallDetectionMethod`, `MotionMaskBuilder` — MOG2 + closing or frame diff masks |
 | `ball_detection.py` | Circular contour filtering, largest-ball selection, `contour_bottom_center`, drawing |
 | `pose_overlay.py` | Throw / normalized-throw / GRU-inference filter overlays (imports `pose_detection`, `throw_detection.inference`) |
-| `recording.py` | Create MP4 writer at `recordings/recording.mp4` |
+| `recording.py` | Create MP4 writer; `extend_video_evenly` re-encodes a clip with evenly distributed duplicate frames |
 | `display.py` | Fit frames to max display size, convert to `PhotoImage` |
 | **throw_detection** | |
 | `config.py` | `BUFFER_SIZE` (GRU rolling window), `TRAINING_SETS_DIR`, `MODELS_DIR` |
@@ -257,6 +281,20 @@ A new throw label while in phase 3 immediately finalises the current trajectory 
 
 Tune via `trajectory_tracking/config.py`: `SECTOR_ANGLE_DEG`, `SECTOR_DIRECTION_DEG`, `SECTOR_RADIUS_PX`, `TRACKING_TIMEOUT_FRAMES`, `MIN_TRAJECTORY_POINTS`, `BALL_CIRCULARITY_MIN/MAX`, `ASSUMED_TORSO_CM`, `TORSO_LENGTH_BUFFER_SIZE`.
 
+## Game tracker (`game_tracker`)
+
+Production app for recording a beer pong session and exporting 3D throw trajectories to JSON.
+
+**UI:** Same record/playback/camera-selection shell as `stereo_viewer`, but **no display filters**. Ball detection method combobox only (MOG2 + closing or frame diff). **Camera setup…** button opens a popup for geometry fields (distances, heights, inter-camera angle, horizontal FOV). Settings persist in `game_tracker/camera_setup.json` (auto-loaded on startup, saved on dialog Save and app close).
+
+**Recording:** Raw frames to `game_tracker/recordings/left.mp4` and `right.mp4`. On stop, `extend_video_evenly` matches the shorter clip to the longer (same procedure as `stereo_viewer`). Fresh `game.json` session header written on stop.
+
+**Tracking (`GameTrackingProcessor`):** Always active during live preview and playback. Main (left) camera: GRU throw inference + wrist-anchored ball tracking. Secondary (right): ball tracking driven by main throw label. Stereo phase gate (`AWAITING_PARTNER`) pairs throws across cameras. Frame-indexed 2D detections captured during `TRACKING_BALL`; when both cameras complete a throw, `triangulate_throw` produces a `ThrowRecord` appended to `game.json`.
+
+**3D coordinate system:** Origin at table center; X along table length, Y along width, Z up from table (meters). Primary camera at `(0, −D_main, H_main)` looking at center (middle of one short end, 90° to table). Secondary at azimuth `−90° + camera_angle_deg`, distance `D_sec`, height `H_sec`, also look-at center. Shared pinhole intrinsics from frame width and `horizontal_fov_deg`. Per-point triangulation via `cv2.triangulatePoints` on matching frame indices (equalized clips — no `framesync` offset). 3D speed from fitted curve arc length ÷ throw duration.
+
+**`game.json` schema (version 1):** `recorded_at`, `fps`, `frame_count`, `videos`, `camera_setup`, `coordinate_system`, `throws[]` with `id`, `start_frame`, `end_frame`, `points_3d`, `fitted_curve_3d`, `speed_m_s`, `tracks_2d` (left/right pixel tracks). Designed for consumption by a future React SPA.
+
 ## Frame sync (`framesync`)
 
 Measures stereo camera desync from a deliberate **sync action**: drop the ball straight down so it bounces on the table. Left camera is **main**.
@@ -290,6 +328,12 @@ Tune via `framesync/config.py`: `DROP_STREAK_FRAMES`, `MAX_HORIZONTAL_DELTA_PX`,
 - **Display:** `STEREO_DISPLAY_MAX_SIZE` (reuses `video_viewer` max size; each panel gets half width)
 - **Capture:** `TARGET_FPS` (alias of `TARGET_RECORD_FPS`)
 
+**`game_tracker/config.py`**
+
+- **Paths:** `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `GAME_JSON`, `SETUP_JSON`
+- **Default geometry:** `DEFAULT_MAIN_DISTANCE_M`, `DEFAULT_SECONDARY_DISTANCE_M`, `DEFAULT_MAIN_HEIGHT_M`, `DEFAULT_SECONDARY_HEIGHT_M`, `DEFAULT_CAMERA_ANGLE_DEG`, `DEFAULT_HORIZONTAL_FOV_DEG`
+- **Triangulation:** `MAX_TRIANGULATION_HEIGHT_M`, `MAX_TRIANGULATION_RESIDUAL_M`
+
 **`pose_detection/config.py`**
 
 - **Model:** `POSE_MODEL_PATH`, `POSE_DEVICE` (default `"mps"`), `POSE_CONF_THRESHOLD`, `POSE_KEYPOINT_MIN_CONF`
@@ -321,7 +365,7 @@ Tune via `framesync/config.py`: `DROP_STREAK_FRAMES`, `MAX_HORIZONTAL_DELTA_PX`,
 
 ## Conventions
 
-- Package code lives under `video_viewer/`, `stereo_viewer/`, `training_recorder/`, `pose_detection/`, `throw_detection/`, `trajectory_tracking/`, and `framesync/`; keep detection logic separate from UI.
+- Package code lives under `video_viewer/`, `stereo_viewer/`, `game_tracker/`, `training_recorder/`, `pose_detection/`, `throw_detection/`, `trajectory_tracking/`, and `framesync/`; keep detection logic separate from UI.
 - Filters affect preview only unless explicitly designed to process recordings.
 - Use `uv` for dependency changes (`uv add <package>`).
 - Recorded videos and `.pt` model weights are gitignored.
@@ -329,7 +373,6 @@ Tune via `framesync/config.py`: `DROP_STREAK_FRAMES`, `MAX_HORIZONTAL_DELTA_PX`,
 
 ## Planned direction (not yet built)
 
-- Ball position fusion across views → 3D trajectory
-- 3D map UI showing historical throws
+- React 3D map UI showing historical throws from `game.json`
 
 When implementing these, update this file and `README.md` to reflect new modules and workflows.

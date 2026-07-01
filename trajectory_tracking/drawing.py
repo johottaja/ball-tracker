@@ -33,6 +33,9 @@ _CURVE_THICKNESS = 5
 _PHASE_FONT = cv2.FONT_HERSHEY_SIMPLEX
 _PHASE_FONT_SCALE = 0.55
 _PHASE_FONT_THICKNESS = 1
+_LARGE_PHASE_FONT = cv2.FONT_HERSHEY_DUPLEX
+_LARGE_PHASE_FONT_SCALE = 1.9
+_LARGE_PHASE_FONT_THICKNESS = 3
 _PHASE_BG = (0, 0, 0)
 _PHASE_TEXT = (220, 220, 220)
 
@@ -91,6 +94,7 @@ def draw_trajectory_overlay(
     sector_radius: int,
     *,
     speed_m_s: float | None = None,
+    large_phase_label: bool = False,
 ) -> np.ndarray:
     """Draw all trajectory-tracking overlays on top of *frame* (copy returned)."""
     output = frame.copy()
@@ -142,7 +146,7 @@ def draw_trajectory_overlay(
             cv2.polylines(output, [pts], False, _CURVE_COLOR, _CURVE_THICKNESS, cv2.LINE_AA)
 
     # Phase label (top-left).
-    _draw_phase_label(output, result.phase)
+    _draw_phase_label(output, result.phase, large=large_phase_label)
 
     # Speed label (top-right) for the last valid completed trajectory.
     if speed_m_s is not None and result.completed_trajectory:
@@ -151,17 +155,25 @@ def draw_trajectory_overlay(
     return output
 
 
-def _draw_phase_label(frame: np.ndarray, phase: Phase) -> None:
+def _draw_phase_label(frame: np.ndarray, phase: Phase, *, large: bool = False) -> None:
     text = phase.value.replace("_", " ")
     margin = 10
-    (tw, th), baseline = cv2.getTextSize(
-        text, _PHASE_FONT, _PHASE_FONT_SCALE, _PHASE_FONT_THICKNESS
-    )
+    if large:
+        font = _LARGE_PHASE_FONT
+        scale = _LARGE_PHASE_FONT_SCALE
+        thickness = _LARGE_PHASE_FONT_THICKNESS
+        pad_x, pad_y = 8, 6
+    else:
+        font = _PHASE_FONT
+        scale = _PHASE_FONT_SCALE
+        thickness = _PHASE_FONT_THICKNESS
+        pad_x, pad_y = 4, 2
+    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
     x, y = margin, margin + th
     cv2.rectangle(
         frame,
-        (x - 4, y - th - 2),
-        (x + tw + 4, y + baseline + 2),
+        (x - pad_x, y - th - pad_y),
+        (x + tw + pad_x, y + baseline + pad_y),
         _PHASE_BG,
         -1,
     )
@@ -169,10 +181,10 @@ def _draw_phase_label(frame: np.ndarray, phase: Phase) -> None:
         frame,
         text,
         (x, y),
-        _PHASE_FONT,
-        _PHASE_FONT_SCALE,
+        font,
+        scale,
         _PHASE_TEXT,
-        _PHASE_FONT_THICKNESS,
+        thickness,
         cv2.LINE_AA,
     )
 

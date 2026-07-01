@@ -12,6 +12,7 @@ wheels/
 # Recorded videos
 video_viewer/recordings/
 stereo_viewer/recordings/
+game_tracker/recordings/
 recordings/
 
 # Labelled throw-detection datasets

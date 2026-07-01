@@ -11,7 +11,7 @@ SECTOR_DIRECTION_DEG: float = 165.0
 SECTOR_RADIUS_PX: int = 400
 
 # Consecutive frames with no ball detection before the trajectory is finalised.
-TRACKING_TIMEOUT_FRAMES: int = 3
+TRACKING_TIMEOUT_FRAMES: int = 5
 
 # Trajectories with fewer detected ball positions are discarded (not shown).
 MIN_TRAJECTORY_POINTS: int = 5
