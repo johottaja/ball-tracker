@@ -158,8 +158,25 @@ def draw_normalized_readout(
     return frame
 
 
-def apply_throw_detection(frame: np.ndarray) -> np.ndarray:
-    hand = detect_dominant_hand(frame)
+def apply_throw_detection(
+    frame: np.ndarray,
+    *,
+    cache: object | None = None,
+    frame_index: int | None = None,
+    detector: PoseDetector | None = None,
+) -> np.ndarray:
+    if cache is not None and frame_index is not None:
+        from .playback_cache import cached_pose_detection
+
+        detection = cached_pose_detection(
+            frame,
+            detector=detector,
+            cache=cache,
+            frame_index=frame_index,
+        )
+        hand = detection.hand if detection is not None else None
+    else:
+        hand = detect_dominant_hand(frame, detector=detector)
     return draw_dominant_hand(frame, hand)
 
 
@@ -268,8 +285,20 @@ def apply_normalized_throw_detection(
     frame: np.ndarray,
     *,
     detector: PoseDetector | None = None,
+    cache: object | None = None,
+    frame_index: int | None = None,
 ) -> np.ndarray:
-    detection = detect_dominant_hand_detection(frame, detector=detector)
+    if cache is not None and frame_index is not None:
+        from .playback_cache import cached_pose_detection
+
+        detection = cached_pose_detection(
+            frame,
+            detector=detector,
+            cache=cache,
+            frame_index=frame_index,
+        )
+    else:
+        detection = detect_dominant_hand_detection(frame, detector=detector)
     output = draw_dominant_hand(frame, detection.hand if detection else None)
     if detection is None:
         return output

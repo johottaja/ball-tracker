@@ -171,6 +171,35 @@ def _polyline_length_3d(points: list[tuple[float, float, float]]) -> float:
     return total
 
 
+def interpolate_track_at_frame(
+    track: list[Point2D],
+    frame: float,
+) -> tuple[float, float] | None:
+    """Linear interpolation of a 2D track at a (possibly fractional) frame index."""
+    if not track:
+        return None
+
+    ordered = sorted(track, key=lambda point: point.frame)
+    if frame < ordered[0].frame or frame > ordered[-1].frame:
+        return None
+
+    for index in range(len(ordered) - 1):
+        start = ordered[index]
+        end = ordered[index + 1]
+        if start.frame <= frame <= end.frame:
+            if end.frame == start.frame:
+                return float(start.x), float(start.y)
+            t = (frame - start.frame) / (end.frame - start.frame)
+            x = start.x + t * (end.x - start.x)
+            y = start.y + t * (end.y - start.y)
+            return x, y
+
+    last = ordered[-1]
+    if frame == last.frame:
+        return float(last.x), float(last.y)
+    return None
+
+
 def _fit_curve_3d(
     points: list[Point3D],
     *,
@@ -212,6 +241,7 @@ def triangulate_throw(
     frame_size: tuple[int, int],
     fps: float,
     throw_id: int,
+    frame_offset: float | None = None,
 ) -> ThrowRecord | None:
     if not left_track or not right_track:
         return None
@@ -223,12 +253,25 @@ def triangulate_throw(
     points_3d: list[Point3D] = []
 
     for left_point in left_track:
-        right_point = right_by_frame.get(left_point.frame)
-        if right_point is None:
+        if left_point.frame is None:
             continue
+        if frame_offset is not None:
+            secondary_coords = interpolate_track_at_frame(
+                right_track,
+                left_point.frame + frame_offset,
+            )
+            if secondary_coords is None:
+                continue
+            right_xy = secondary_coords
+        else:
+            right_point = right_by_frame.get(left_point.frame)
+            if right_point is None:
+                continue
+            right_xy = (float(right_point.x), float(right_point.y))
+
         triangulated, _residual = _triangulate_point(
             np.array([left_point.x, left_point.y], dtype=np.float64),
-            np.array([right_point.x, right_point.y], dtype=np.float64),
+            np.array(right_xy, dtype=np.float64),
             model,
         )
         if triangulated is None:

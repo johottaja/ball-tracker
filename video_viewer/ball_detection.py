@@ -41,6 +41,35 @@ def find_largest_ball_contour(cleaned: np.ndarray) -> np.ndarray | None:
     return max(valid_ball_contours, key=cv2.contourArea)
 
 
+def find_hybrid_ball_contour(
+    mog2_mask: np.ndarray | None,
+    frame_diff_mask: np.ndarray | None,
+) -> np.ndarray | None:
+    """Prefer MOG2 contour when both methods detect a ball."""
+    mog2_contour = (
+        find_largest_ball_contour(mog2_mask)
+        if mog2_mask is not None
+        else None
+    )
+    if mog2_contour is not None:
+        return mog2_contour
+    if frame_diff_mask is None:
+        return None
+    return find_largest_ball_contour(frame_diff_mask)
+
+
+def find_hybrid_circular_contours(
+    mog2_mask: np.ndarray | None,
+    frame_diff_mask: np.ndarray | None,
+) -> list[np.ndarray]:
+    contours: list[np.ndarray] = []
+    if mog2_mask is not None:
+        contours.extend(find_circular_contours(mog2_mask))
+    if frame_diff_mask is not None:
+        contours.extend(find_circular_contours(frame_diff_mask))
+    return contours
+
+
 def contour_bottom_center(contour: np.ndarray) -> tuple[int, int]:
     """Return the bottom-center of a contour's axis-aligned bounding box."""
     x, y, width, height = cv2.boundingRect(contour)

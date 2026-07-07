@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from throw_detection.inference import default_throw_model_path
+from trajectory_tracking.config import BALL_CIRCULARITY_MAX, BALL_CIRCULARITY_MIN
 
 PACKAGE_DIR = Path(__file__).resolve().parent
 RECORDINGS_DIR = PACKAGE_DIR / "recordings"
@@ -15,10 +16,8 @@ FRAME_DIFF_MORPH_KERNEL_SIZE = 5
 MOG2_HISTORY = 300
 MOG2_VAR_THRESHOLD = 24
 MOG2_DETECT_SHADOWS = True
-MOG2_MORPH_KERNEL_SIZE = 6
-BALL_CIRCULARITY_MIN = 0.4
-BALL_CIRCULARITY_MAX = 1.0
-BALL_CONTOUR_MIN_AREA = 150
+MOG2_MORPH_KERNEL_SIZE = 4
+BALL_CONTOUR_MIN_AREA = 50
 DETECTION_RECT_THICKNESS = 6
 
 POSE_JOINT_RADIUS = 8

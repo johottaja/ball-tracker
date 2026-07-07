@@ -9,9 +9,15 @@ from .ball_detection import (
     draw_ball_rectangle,
     draw_circular_contours,
     find_circular_contours,
+    find_hybrid_ball_contour,
+    find_hybrid_circular_contours,
     find_largest_ball_contour,
 )
-from .ball_motion import BallDetectionMethod, MotionMaskBuilder
+from .ball_motion import (
+    BallDetectionMethod,
+    MotionMaskBuilder,
+    combine_hybrid_masks,
+)
 from throw_detection.inference import ThrowInference
 from pose_detection import torso_scale
 from trajectory_tracking import TrajectoryTracker
@@ -76,15 +82,47 @@ def detect_ball_contour(
     reference: np.ndarray | None,
     *,
     mog2_warmup_frames: list[np.ndarray] | None = None,
+    cache: object | None = None,
+    frame_index: int | None = None,
 ) -> np.ndarray | None:
+    if motion_builder.method == BallDetectionMethod.HYBRID:
+        mog2_mask, frame_diff_mask = motion_builder.build_component_masks(
+            current,
+            reference,
+            mog2_warmup_frames=mog2_warmup_frames,
+            cache=cache,
+            frame_index=frame_index,
+        )
+        return find_hybrid_ball_contour(mog2_mask, frame_diff_mask)
+
     cleaned = motion_builder.build_mask(
         current,
         reference,
         mog2_warmup_frames=mog2_warmup_frames,
+        cache=cache,
+        frame_index=frame_index,
     )
     if cleaned is None:
         return None
     return find_largest_ball_contour(_mask_to_bgr(cleaned))
+
+
+def apply_contours_from_mask(mask: np.ndarray) -> np.ndarray:
+    mask_bgr = _mask_to_bgr(mask)
+    contours = find_circular_contours(mask_bgr)
+    return draw_circular_contours(mask_bgr, contours)
+
+
+def apply_hybrid_contours(
+    mog2_mask: np.ndarray | None,
+    frame_diff_mask: np.ndarray | None,
+) -> np.ndarray:
+    background = combine_hybrid_masks(mog2_mask, frame_diff_mask)
+    if background is None:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+    mask_bgr = _mask_to_bgr(background)
+    contours = find_hybrid_circular_contours(mog2_mask, frame_diff_mask)
+    return draw_circular_contours(mask_bgr, contours)
 
 
 def apply_contours(
@@ -93,17 +131,40 @@ def apply_contours(
     reference: np.ndarray | None,
     *,
     mog2_warmup_frames: list[np.ndarray] | None = None,
+    cache: object | None = None,
+    frame_index: int | None = None,
 ) -> np.ndarray:
+    if motion_builder.method == BallDetectionMethod.HYBRID:
+        mog2_mask, frame_diff_mask = motion_builder.build_component_masks(
+            current,
+            reference,
+            mog2_warmup_frames=mog2_warmup_frames,
+            cache=cache,
+            frame_index=frame_index,
+        )
+        if mog2_mask is None and frame_diff_mask is None:
+            return np.zeros_like(current)
+        return apply_hybrid_contours(mog2_mask, frame_diff_mask)
+
+    if (
+        cache is not None
+        and frame_index is not None
+        and cache.has_motion_mask(motion_builder.method, frame_index)
+    ):
+        return apply_contours_from_mask(
+            cache.get_motion_mask(motion_builder.method, frame_index)
+        )
+
     cleaned = motion_builder.build_mask(
         current,
         reference,
         mog2_warmup_frames=mog2_warmup_frames,
+        cache=cache,
+        frame_index=frame_index,
     )
     if cleaned is None:
         return np.zeros_like(current)
-    mask_bgr = _mask_to_bgr(cleaned)
-    contours = find_circular_contours(mask_bgr)
-    return draw_circular_contours(mask_bgr, contours)
+    return apply_contours_from_mask(cleaned)
 
 
 def apply_detection(
@@ -112,14 +173,23 @@ def apply_detection(
     reference: np.ndarray | None,
     *,
     mog2_warmup_frames: list[np.ndarray] | None = None,
+    cache: object | None = None,
+    frame_index: int | None = None,
 ) -> np.ndarray:
     ball_contour = detect_ball_contour(
         motion_builder,
         current,
         reference,
         mog2_warmup_frames=mog2_warmup_frames,
+        cache=cache,
+        frame_index=frame_index,
     )
     return draw_ball_rectangle(current, ball_contour)
+
+
+_STATEFUL_FILTER_IDS = frozenset(
+    {FilterId.TRAJECTORY_TRACKING, FilterId.STEREO_TRACKING, FilterId.FRAME_SYNC}
+)
 
 
 class FrameFilter:
@@ -192,50 +262,115 @@ class FrameFilter:
         mog2_warmup_frames: list[np.ndarray] | None = None,
         warmup_frames: list[np.ndarray] | None = None,
         video_fps: float | None = None,
+        frame_index: int | None = None,
+        cache: object | None = None,
+        warmup_start_index: int | None = None,
     ) -> np.ndarray:
+        if (
+            cache is not None
+            and frame_index is not None
+            and self.filter_id in _STATEFUL_FILTER_IDS
+            and cache.has_filter_output(
+                self.filter_id.value, self.ball_detection_method, frame_index
+            )
+        ):
+            return cache.get_filter_output(
+                self.filter_id.value, self.ball_detection_method, frame_index
+            )
+
         if self.filter_id == FilterId.NONE:
             return frame
 
         if self.filter_id == FilterId.CONTOURS:
-            return apply_contours(
+            output = apply_contours(
                 self._motion_builder,
                 frame,
                 previous_frame,
                 mog2_warmup_frames=mog2_warmup_frames,
+                cache=cache,
+                frame_index=frame_index,
             )
-
-        if self.filter_id == FilterId.DETECTION:
-            return apply_detection(
+        elif self.filter_id == FilterId.DETECTION:
+            output = apply_detection(
                 self._motion_builder,
                 frame,
                 previous_frame,
                 mog2_warmup_frames=mog2_warmup_frames,
+                cache=cache,
+                frame_index=frame_index,
             )
-
-        if self.filter_id == FilterId.THROW_DETECTION:
-            return apply_throw_detection(frame)
-
-        if self.filter_id == FilterId.NORMALIZED_THROW_DETECTION:
-            return apply_normalized_throw_detection(frame)
-
-        if self.filter_id == FilterId.GRU_THROW_INFERENCE:
-            inference = self._ensure_throw_inference()
-            if inference is None:
-                output = apply_normalized_throw_detection(frame)
-                return _draw_missing_model_banner(output)
-            prediction = inference.predict(frame, warmup_frames=warmup_frames)
-            return apply_gru_throw_inference(frame, prediction)
-
-        if self.filter_id == FilterId.TRAJECTORY_TRACKING:
-            return self._apply_trajectory_tracking(
+        elif self.filter_id == FilterId.THROW_DETECTION:
+            output = apply_throw_detection(
+                frame,
+                cache=cache,
+                frame_index=frame_index,
+            )
+        elif self.filter_id == FilterId.NORMALIZED_THROW_DETECTION:
+            output = apply_normalized_throw_detection(
+                frame,
+                cache=cache,
+                frame_index=frame_index,
+            )
+        elif self.filter_id == FilterId.GRU_THROW_INFERENCE:
+            output = self._apply_gru_throw_inference(
+                frame,
+                warmup_frames=warmup_frames,
+                warmup_start_index=warmup_start_index,
+                cache=cache,
+                frame_index=frame_index,
+            )
+        elif self.filter_id == FilterId.TRAJECTORY_TRACKING:
+            output = self._apply_trajectory_tracking(
                 frame,
                 previous_frame=previous_frame,
                 mog2_warmup_frames=mog2_warmup_frames,
                 warmup_frames=warmup_frames,
+                warmup_start_index=warmup_start_index,
                 video_fps=video_fps,
+                cache=cache,
+                frame_index=frame_index,
             )
+        else:
+            return frame
 
-        return frame
+        if (
+            cache is not None
+            and frame_index is not None
+            and self.filter_id in _STATEFUL_FILTER_IDS
+        ):
+            cache.put_filter_output(
+                self.filter_id.value,
+                self.ball_detection_method,
+                frame_index,
+                output,
+            )
+        return output
+
+    def _apply_gru_throw_inference(
+        self,
+        frame: np.ndarray,
+        *,
+        warmup_frames: list[np.ndarray] | None,
+        warmup_start_index: int | None,
+        cache: object | None,
+        frame_index: int | None,
+    ) -> np.ndarray:
+        inference = self._ensure_throw_inference()
+        if inference is None:
+            output = apply_normalized_throw_detection(
+                frame,
+                cache=cache,
+                frame_index=frame_index,
+            )
+            return _draw_missing_model_banner(output)
+        prediction = inference.predict(
+            frame,
+            warmup_frames=warmup_frames,
+            warmup_start_index=warmup_start_index,
+            cache=cache,
+            frame_index=frame_index,
+        )
+        return apply_gru_throw_inference(frame, prediction)
 
     def _apply_trajectory_tracking(
         self,
@@ -244,7 +379,10 @@ class FrameFilter:
         previous_frame: np.ndarray | None,
         mog2_warmup_frames: list[np.ndarray] | None,
         warmup_frames: list[np.ndarray] | None,
+        warmup_start_index: int | None,
         video_fps: float | None,
+        cache: object | None,
+        frame_index: int | None,
     ) -> np.ndarray:
         inference = self._ensure_throw_inference()
         tracker = self._ensure_trajectory_tracker()
@@ -259,18 +397,35 @@ class FrameFilter:
             self._last_completion_id = 0
 
         if inference is None:
-            self._motion_builder.build_mask(frame, previous_frame)
-            output = apply_normalized_throw_detection(frame)
+            self._motion_builder.build_tracking_masks(
+                frame,
+                previous_frame,
+                cache=cache,
+                frame_index=frame_index,
+            )
+            output = apply_normalized_throw_detection(
+                frame,
+                cache=cache,
+                frame_index=frame_index,
+            )
             return _draw_missing_model_banner(output)
 
-        prediction = inference.predict(frame, warmup_frames=warmup_frames)
+        prediction = inference.predict(
+            frame,
+            warmup_frames=warmup_frames,
+            warmup_start_index=warmup_start_index,
+            cache=cache,
+            frame_index=frame_index,
+        )
 
         self._torso_length_buffer.add(_extract_torso_length_px(prediction.detection))
 
-        motion_mask = self._motion_builder.build_mask(
+        motion_mask, alternate_motion_mask = self._motion_builder.build_tracking_masks(
             frame,
             previous_frame,
             mog2_warmup_frames=mog2_warmup_frames,
+            cache=cache,
+            frame_index=frame_index,
         )
 
         wrist_pos = _extract_wrist_pos(prediction.detection)
@@ -278,10 +433,14 @@ class FrameFilter:
             throw_label=prediction.label,
             wrist_pos=wrist_pos,
             motion_mask=motion_mask,
+            alternate_motion_mask=alternate_motion_mask,
+            frame_index=frame_index,
         )
 
         if tracking_result.completion_id != self._last_completion_id:
             self._last_completion_id = tracking_result.completion_id
+            tracker.apply_release_extension(cache)
+            tracking_result = tracker._result_snapshot(tracking_result.detected_ball_pos)
             self._completed_speed_m_s = estimate_throw_speed_m_s(
                 tracking_result.fitted_curve_points,
                 self._torso_length_buffer.smoothed,

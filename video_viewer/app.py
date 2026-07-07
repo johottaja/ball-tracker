@@ -20,7 +20,7 @@ from .playback import (
     uses_gru_streaming,
     uses_mog2_streaming,
 )
-from .recording import create_writer
+from .playback_cache import PlaybackCache
 
 
 class VideoViewerApp:
@@ -50,6 +50,7 @@ class VideoViewerApp:
         self.camera_index = 0
         self.cameras: list[CameraDevice] = []
         self.frame_filter = FrameFilter()
+        self.playback_cache = PlaybackCache()
         self._last_raw_frame: np.ndarray | None = None
         self._gru_stream_frame_index: int | None = None
         self._mog2_stream_frame_index: int | None = None
@@ -149,6 +150,7 @@ class VideoViewerApp:
     def _on_filter_change(self) -> None:
         self._gru_stream_frame_index = None
         self._mog2_stream_frame_index = None
+        self.playback_cache.clear_filter_outputs()
         self.frame_filter.set_filter(self.filter_controls.selected_filter_id())
         self.filter_controls.sync_combo_from_var()
         self._refresh_visible_frame()
@@ -156,6 +158,8 @@ class VideoViewerApp:
     def _on_ball_method_change(self) -> None:
         self._gru_stream_frame_index = None
         self._mog2_stream_frame_index = None
+        self.playback_cache.clear_filter_outputs()
+        self.playback_cache.clear_motion_masks()
         self.frame_filter.set_ball_detection_method(
             self.filter_controls.selected_ball_detection_method()
         )
@@ -185,6 +189,7 @@ class VideoViewerApp:
         self._cancel_after()
         self._gru_stream_frame_index = None
         self._mog2_stream_frame_index = None
+        self.playback_cache.clear()
         self.frame_filter.reset()
         self.playing = False
         if self.writer is not None:
@@ -329,6 +334,7 @@ class VideoViewerApp:
         height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.display_size = fit_size(width, height)
         self.frame_index = 0
+        self.playback_cache.clear()
         self._show_frame_at(0)
         self._update_status()
 
@@ -409,12 +415,13 @@ class VideoViewerApp:
         if self.frame_index < 0:
             self.frame_index = index
 
-        previous, mog2_warmup, warmup_frames = filter_inputs_for_playback(
+        previous, mog2_warmup, warmup_frames, warmup_start_index = filter_inputs_for_playback(
             self.cap,
             self.frame_filter,
             self.frame_index,
             self._gru_stream_frame_index,
             self._mog2_stream_frame_index,
+            cache=self.playback_cache.main,
         )
 
         self._display_frame(
@@ -422,6 +429,7 @@ class VideoViewerApp:
             previous_frame=previous,
             mog2_warmup_frames=mog2_warmup,
             warmup_frames=warmup_frames,
+            warmup_start_index=warmup_start_index,
         )
         if uses_gru_streaming(self.frame_filter):
             self._gru_stream_frame_index = self.frame_index
@@ -437,8 +445,11 @@ class VideoViewerApp:
         previous_frame: np.ndarray | None = None,
         mog2_warmup_frames: list[np.ndarray] | None = None,
         warmup_frames: list[np.ndarray] | None = None,
+        warmup_start_index: int | None = None,
     ) -> None:
         video_fps = self.fps if self.mode.get() == "playback" else None
+        frame_index = self.frame_index if self.mode.get() == "playback" else None
+        cache = self.playback_cache.main if self.mode.get() == "playback" else None
         self.frame_photo = frame_to_display_photo(
             self.frame_filter,
             frame,
@@ -446,7 +457,10 @@ class VideoViewerApp:
             previous_frame=previous_frame,
             mog2_warmup_frames=mog2_warmup_frames,
             warmup_frames=warmup_frames,
+            warmup_start_index=warmup_start_index,
             video_fps=video_fps,
+            frame_index=frame_index,
+            cache=cache,
         )
         self.video_label.configure(image=self.frame_photo, text="")
 

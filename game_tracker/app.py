@@ -11,6 +11,7 @@ import numpy as np
 from video_viewer.ball_motion import (
     BALL_DETECTION_METHOD_LABELS,
     BallDetectionMethod,
+    uses_mog2_component,
 )
 from video_viewer.camera import (
     CameraDevice,
@@ -20,12 +21,12 @@ from video_viewer.camera import (
     probe_cameras,
 )
 from video_viewer.playback import (
-    gru_warmup_frames_if_needed,
-    mog2_warmup_frames_if_needed,
-    previous_frame_for_diff,
+    gru_warmup_for_playback,
+    stereo_ball_mask_playback_inputs,
     read_frame_at,
     step_index_by_seconds,
 )
+from video_viewer.playback_cache import PlaybackCache
 from video_viewer.recording import create_writer, extend_video_evenly
 
 from .config import (
@@ -79,6 +80,7 @@ class GameTrackerApp:
         self.processor = GameTrackingProcessor()
         self.processor.set_camera_setup(self.camera_setup)
         self.processor.set_on_throw_recorded(self._on_throw_recorded)
+        self.playback_cache = PlaybackCache()
 
         self.recording = False
         self.playing = False
@@ -221,6 +223,7 @@ class GameTrackerApp:
         method = self._selected_ball_method()
         self.ball_method_var.set(method.value)
         self.processor.set_ball_detection_method(self._selected_ball_method())
+        self.playback_cache.clear_motion_masks()
         for stream in self._streams():
             stream.gru_stream_frame_index = None
             stream.mog2_stream_frame_index = None
@@ -302,6 +305,7 @@ class GameTrackerApp:
         self._cancel_after()
         self.playing = False
         self.processor.reset_tracking()
+        self.playback_cache.clear()
         for stream in self._streams():
             self._release_stream(stream)
 
@@ -506,6 +510,7 @@ class GameTrackerApp:
         height = int(self.left.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.panel_size = panel_size_for_frame(width, height, DISPLAY_MAX_SIZE)
         self.frame_index = 0
+        self.playback_cache.clear()
 
         existing = load_game(GAME_JSON)
         if existing is not None:
@@ -527,38 +532,38 @@ class GameTrackerApp:
         list[np.ndarray] | None,
         list[np.ndarray] | None,
         list[np.ndarray] | None,
+        int | None,
     ]:
-        left_warmup = gru_warmup_frames_if_needed(
+        left_warmup, left_warmup_start_index = gru_warmup_for_playback(
             self.left.cap,
             frame_index,
             self.left.gru_stream_frame_index,
             self.processor.throw_buffer_size(),
+            self.playback_cache.main,
         )
         method = self._selected_ball_method()
-        if method == BallDetectionMethod.FRAME_DIFF:
-            left_previous = previous_frame_for_diff(self.left.cap, frame_index)
-            right_previous = previous_frame_for_diff(self.right.cap, frame_index)
-            left_mog2_warmup = None
-            right_mog2_warmup = None
-        else:
-            left_previous = None
-            right_previous = None
-            left_mog2_warmup = mog2_warmup_frames_if_needed(
-                self.left.cap,
-                frame_index,
-                self.left.mog2_stream_frame_index,
-            )
-            right_mog2_warmup = mog2_warmup_frames_if_needed(
-                self.right.cap,
-                frame_index,
-                self.right.mog2_stream_frame_index,
-            )
+        (
+            left_previous,
+            right_previous,
+            left_mog2_warmup,
+            right_mog2_warmup,
+        ) = stereo_ball_mask_playback_inputs(
+            self.left.cap,
+            self.right.cap,
+            method,
+            frame_index,
+            self.left.mog2_stream_frame_index,
+            self.right.mog2_stream_frame_index,
+            self.playback_cache.main,
+            self.playback_cache.secondary,
+        )
         return (
             left_previous,
             right_previous,
             left_mog2_warmup,
             right_mog2_warmup,
             left_warmup,
+            left_warmup_start_index,
         )
 
     def _show_raw_stereo(
@@ -580,6 +585,7 @@ class GameTrackerApp:
         left_mog2_warmup: list[np.ndarray] | None = None,
         right_mog2_warmup: list[np.ndarray] | None = None,
         left_warmup: list[np.ndarray] | None = None,
+        left_warmup_start_index: int | None = None,
         video_fps: float | None = None,
     ) -> None:
         if self.mode.get() == "record":
@@ -591,11 +597,13 @@ class GameTrackerApp:
             right_frame,
             frame_index=frame_index,
             main_warmup_frames=left_warmup,
+            main_warmup_start_index=left_warmup_start_index,
             main_previous_frame=left_previous,
             main_mog2_warmup_frames=left_mog2_warmup,
             secondary_previous_frame=right_previous,
             secondary_mog2_warmup_frames=right_mog2_warmup,
             video_fps=video_fps,
+            cache=self.playback_cache,
         )
         self.frame_photo = stereo_frame_to_photo(left_out, right_out, self.panel_size)
         self.video_label.configure(image=self.frame_photo, text="")
@@ -758,6 +766,7 @@ class GameTrackerApp:
             left_mog2_warmup,
             right_mog2_warmup,
             left_warmup,
+            left_warmup_start_index,
         ) = self._playback_warmup_inputs(index)
 
         self._display_stereo_frames(
@@ -769,11 +778,12 @@ class GameTrackerApp:
             left_mog2_warmup=left_mog2_warmup,
             right_mog2_warmup=right_mog2_warmup,
             left_warmup=left_warmup,
+            left_warmup_start_index=left_warmup_start_index,
             video_fps=video_fps,
         )
 
         self.left.gru_stream_frame_index = self.frame_index
-        if self._selected_ball_method() == BallDetectionMethod.MOG2_CLOSING:
+        if uses_mog2_component(self._selected_ball_method()):
             self.left.mog2_stream_frame_index = self.frame_index
             self.right.mog2_stream_frame_index = self.frame_index
 

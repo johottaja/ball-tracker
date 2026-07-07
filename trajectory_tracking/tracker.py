@@ -8,15 +8,18 @@ import cv2
 import numpy as np
 
 from .config import (
+    AWAITING_PARTNER_TIMEOUT_FRAMES,
     BALL_CIRCULARITY_MAX,
     BALL_CIRCULARITY_MIN,
     BALL_CONTOUR_MIN_AREA,
     MIN_TRAJECTORY_POINTS,
+    SCANNING_TIMEOUT_FRAMES,
     SECTOR_ANGLE_DEG,
     SECTOR_DIRECTION_DEG,
     SECTOR_RADIUS_PX,
     TRACKING_TIMEOUT_FRAMES,
 )
+from .release import ParabolaFit, fit_parabola, sample_parabola
 
 
 class Phase(str, Enum):
@@ -49,6 +52,12 @@ class TrajectoryResult:
     # Sampled parabola points for the completed trajectory (None if < 3 points).
     fitted_curve_points: list[tuple[int, int]] | None
 
+    # Quadratic fit for the completed trajectory (None if < 3 points).
+    completed_parabola_fit: ParabolaFit | None
+
+    # Frame index per completed trajectory point (parallel to completed_trajectory).
+    completed_trajectory_frames: list[int] | None
+
     # Frames spent in TRACKING_BALL for the most recently completed trajectory.
     completed_tracking_frames: int | None
 
@@ -75,22 +84,33 @@ class TrajectoryTracker:
         sector_direction_deg: float = SECTOR_DIRECTION_DEG,
         sector_radius: int = SECTOR_RADIUS_PX,
         timeout_frames: int = TRACKING_TIMEOUT_FRAMES,
+        scanning_timeout_frames: int = SCANNING_TIMEOUT_FRAMES,
+        awaiting_partner_timeout_frames: int = AWAITING_PARTNER_TIMEOUT_FRAMES,
     ) -> None:
         self._sector_half_angle = sector_angle_deg / 2.0
         self._sector_direction_deg = sector_direction_deg
         self.sector_radius = sector_radius
         self.timeout_frames = timeout_frames
+        self.scanning_timeout_frames = scanning_timeout_frames
+        self.awaiting_partner_timeout_frames = awaiting_partner_timeout_frames
 
         self.phase = Phase.DETECTING_THROW
         self._scan_origin: tuple[int, int] | None = None
+        self._scan_frame_count: int = 0
+        self._awaiting_frame_count: int = 0
         self._miss_count: int = 0
         self._trajectory_points: list[tuple[int, int]] = []
+        self._trajectory_frames: list[int] = []
         self._completed_trajectory: list[tuple[int, int]] | None = None
+        self._completed_trajectory_frames: list[int] | None = None
         self._fitted_curve_points: list[tuple[int, int]] | None = None
+        self._completed_parabola_fit: ParabolaFit | None = None
         self._tracking_frame_count: int = 0
         self._completed_tracking_frames: int | None = None
         self._completion_id: int = 0
         self._full_frame_scan: bool = False
+        self._stereo_reconcile: bool = False
+        self._awaiting_valid_completion: bool = False
 
     def reset(self) -> None:
         self.phase = Phase.DETECTING_THROW
@@ -98,11 +118,95 @@ class TrajectoryTracker:
         self._full_frame_scan = False
         self._miss_count = 0
         self._trajectory_points = []
+        self._trajectory_frames = []
         self._completed_trajectory = None
+        self._completed_trajectory_frames = None
         self._fitted_curve_points = None
+        self._completed_parabola_fit = None
         self._tracking_frame_count = 0
         self._completed_tracking_frames = None
         self._completion_id = 0
+        self._scan_frame_count = 0
+        self._awaiting_frame_count = 0
+        self._stereo_reconcile = False
+        self._awaiting_valid_completion = False
+
+    def exit_awaiting_partner(self) -> None:
+        """Leave AWAITING_PARTNER and return to throw detection."""
+        self.phase = Phase.DETECTING_THROW
+        self._awaiting_frame_count = 0
+        self._awaiting_valid_completion = False
+
+    def pop_stereo_reconcile(self) -> bool:
+        """Return whether this camera needs to follow the partner phase this frame."""
+        if not self._stereo_reconcile:
+            return False
+        self._stereo_reconcile = False
+        return True
+
+    def ball_search_origin(self) -> tuple[int, int] | None:
+        """Best origin for (re)joining ball search: last track point or scan anchor."""
+        if self._trajectory_points:
+            return self._trajectory_points[-1]
+        return self._scan_origin
+
+    def adopt_partner_phase(
+        self,
+        partner: TrajectoryTracker,
+        *,
+        is_secondary: bool,
+        throw_label: int,
+        wrist_pos: tuple[int, int] | None,
+    ) -> None:
+        """Mirror the partner's phase after a failed local throw or scan."""
+        partner_phase = partner.phase
+
+        if partner_phase == Phase.AWAITING_PARTNER:
+            self._enter_awaiting_partner(valid_completion=False)
+            return
+
+        if partner_phase == Phase.TRACKING_BALL:
+            origin = partner.ball_search_origin()
+            if origin is None:
+                self.exit_awaiting_partner()
+                return
+            if is_secondary:
+                self._enter_scanning_at_origin(origin)
+            elif throw_label == 1 and wrist_pos is not None:
+                self._enter_scanning(wrist_pos)
+            else:
+                self._enter_scanning_at_origin(origin)
+            return
+
+        if partner_phase == Phase.SCANNING_BALL:
+            if is_secondary:
+                if partner._full_frame_scan:
+                    self._enter_scanning_full_frame()
+                elif partner._scan_origin is not None:
+                    self._enter_scanning_at_origin(partner._scan_origin)
+                else:
+                    self._enter_scanning_full_frame()
+            elif throw_label == 1 and wrist_pos is not None:
+                self._enter_scanning(wrist_pos)
+            elif partner._scan_origin is not None:
+                self._enter_scanning_at_origin(partner._scan_origin)
+            else:
+                self.exit_awaiting_partner()
+            return
+
+        self.exit_awaiting_partner()
+
+    def _mark_stereo_reconcile(self) -> None:
+        self._stereo_reconcile = True
+        self.phase = Phase.DETECTING_THROW
+        self._scan_origin = None
+        self._full_frame_scan = False
+
+    def _complete_throw_stereo(self, saved: bool) -> None:
+        if saved:
+            self._enter_awaiting_partner()
+        else:
+            self._mark_stereo_reconcile()
 
     # ------------------------------------------------------------------
     # Public update API
@@ -114,10 +218,15 @@ class TrajectoryTracker:
         wrist_pos: tuple[int, int] | None,
         motion_mask: np.ndarray | None,
         *,
+        alternate_motion_mask: np.ndarray | None = None,
         defer_detecting_throw: bool = False,
+        frame_index: int | None = None,
     ) -> TrajectoryResult:
         """Advance the tracker by one frame and return a result snapshot."""
         if self.phase == Phase.AWAITING_PARTNER:
+            self._awaiting_frame_count += 1
+            if self._awaiting_frame_count >= self.awaiting_partner_timeout_frames:
+                self.exit_awaiting_partner()
             return self._result_snapshot(None)
 
         detected_pos: tuple[int, int] | None = None
@@ -127,52 +236,116 @@ class TrajectoryTracker:
                 self._enter_scanning(wrist_pos)
 
         elif self.phase == Phase.SCANNING_BALL:
-            if throw_label == 1 and wrist_pos is not None:
-                # Keep resetting the wrist anchor while the throw is still on.
-                self._enter_scanning(wrist_pos)
+            if throw_label == 1:
+                self._scan_frame_count = 0
+                if wrist_pos is not None:
+                    self._scan_origin = wrist_pos
 
-            if motion_mask is not None and self._scan_origin is not None:
-                detected_pos = self._find_ball(motion_mask)
+            if self._scan_origin is not None:
+                detected_pos = self._find_ball_merged(motion_mask, alternate_motion_mask)
                 if detected_pos is not None:
                     # First detection – transition to tracking.
                     self._scan_origin = detected_pos
                     self._trajectory_points = [detected_pos]
+                    self._trajectory_frames = (
+                        [frame_index] if frame_index is not None else []
+                    )
                     self._miss_count = 0
                     self._tracking_frame_count = 1
                     self.phase = Phase.TRACKING_BALL
 
+            if self.phase == Phase.SCANNING_BALL and throw_label == 0:
+                self._scan_frame_count += 1
+                if self._scan_frame_count >= self.scanning_timeout_frames:
+                    self._exit_scanning_failed(defer_detecting_throw)
+
         else:  # TRACKING_BALL
             self._tracking_frame_count += 1
             if throw_label == 1 and wrist_pos is not None:
-                # A new throw starts while we were tracking – finalise and restart.
-                self._finalize_trajectory()
-                self._enter_scanning(wrist_pos)
+                saved = self._finalize_trajectory()
+                if defer_detecting_throw:
+                    if saved:
+                        self._enter_awaiting_partner()
+                    else:
+                        self._mark_stereo_reconcile()
+                else:
+                    self._enter_scanning(wrist_pos)
             else:
-                if motion_mask is not None:
-                    detected_pos = self._find_ball(motion_mask)
+                detected_pos = self._find_ball_merged(motion_mask, alternate_motion_mask)
 
                 if detected_pos is not None:
                     self._scan_origin = detected_pos
                     self._trajectory_points.append(detected_pos)
+                    if frame_index is not None:
+                        self._trajectory_frames.append(frame_index)
                     self._miss_count = 0
                 else:
                     self._miss_count += 1
                     if self._miss_count >= self.timeout_frames:
-                        self._finalize_trajectory()
-                        self.phase = (
-                            Phase.AWAITING_PARTNER
-                            if defer_detecting_throw
-                            else Phase.DETECTING_THROW
-                        )
+                        saved = self._finalize_trajectory()
+                        if defer_detecting_throw:
+                            self._complete_throw_stereo(saved)
+                        else:
+                            self.phase = Phase.DETECTING_THROW
 
         return self._result_snapshot(detected_pos)
+
+    def apply_release_extension(self, cache: object | None) -> None:
+        """Prepend a release point to the last completed trajectory using cached pose."""
+        if self._completed_trajectory is None:
+            return
+        from .release import extend_completed_trajectory
+
+        extended, curve, release = extend_completed_trajectory(
+            self._completed_trajectory,
+            self._completed_trajectory_frames,
+            self._completed_parabola_fit,
+            cache,
+        )
+        if release is None:
+            return
+        self._completed_trajectory = extended
+        if self._completed_trajectory_frames is not None:
+            self._completed_trajectory_frames = [
+                release.frame,
+                *self._completed_trajectory_frames,
+            ]
+        if curve is not None:
+            self._fitted_curve_points = curve
+            refit = fit_parabola(extended)
+            if refit is not None:
+                self._completed_parabola_fit = refit
+
+    def apply_secondary_release_extension(self, release_frame: int) -> None:
+        """Prepend a release point extrapolated to match the main camera release frame."""
+        if self._completed_trajectory is None:
+            return
+        from .release import apply_secondary_release_extension as extend_secondary
+
+        extended, curve = extend_secondary(
+            self._completed_trajectory,
+            self._completed_trajectory_frames,
+            self._completed_parabola_fit,
+            release_frame,
+        )
+        if curve is None:
+            return
+        self._completed_trajectory = extended
+        if self._completed_trajectory_frames is not None:
+            self._completed_trajectory_frames = [release_frame, *self._completed_trajectory_frames]
+        self._fitted_curve_points = curve
+        refit = fit_parabola(extended)
+        if refit is not None:
+            self._completed_parabola_fit = refit
 
     def update_secondary(
         self,
         throw_label: int,
         motion_mask: np.ndarray | None,
         *,
+        alternate_motion_mask: np.ndarray | None = None,
         defer_detecting_throw: bool = False,
+        frame_index: int | None = None,
     ) -> TrajectoryResult:
         """
         Ball-only tracker for a secondary camera view.
@@ -181,6 +354,9 @@ class TrajectoryTracker:
         search starts with a full-frame scan because there is no wrist anchor.
         """
         if self.phase == Phase.AWAITING_PARTNER:
+            self._awaiting_frame_count += 1
+            if self._awaiting_frame_count >= self.awaiting_partner_timeout_frames:
+                self.exit_awaiting_partner()
             return self._result_snapshot(None)
 
         detected_pos: tuple[int, int] | None = None
@@ -190,38 +366,54 @@ class TrajectoryTracker:
                 self._enter_scanning_full_frame()
 
         elif self.phase == Phase.SCANNING_BALL:
-            if motion_mask is not None:
-                detected_pos = self._find_ball(motion_mask)
-                if detected_pos is not None:
-                    self._full_frame_scan = False
-                    self._scan_origin = detected_pos
-                    self._trajectory_points = [detected_pos]
-                    self._miss_count = 0
-                    self._tracking_frame_count = 1
-                    self.phase = Phase.TRACKING_BALL
+            if throw_label == 1:
+                self._scan_frame_count = 0
+
+            detected_pos = self._find_ball_merged(motion_mask, alternate_motion_mask)
+            if detected_pos is not None:
+                self._full_frame_scan = False
+                self._scan_origin = detected_pos
+                self._trajectory_points = [detected_pos]
+                self._trajectory_frames = (
+                    [frame_index] if frame_index is not None else []
+                )
+                self._miss_count = 0
+                self._tracking_frame_count = 1
+                self.phase = Phase.TRACKING_BALL
+
+            if self.phase == Phase.SCANNING_BALL and throw_label == 0:
+                self._scan_frame_count += 1
+                if self._scan_frame_count >= self.scanning_timeout_frames:
+                    self._exit_scanning_failed(defer_detecting_throw)
 
         else:  # TRACKING_BALL
             self._tracking_frame_count += 1
             if throw_label == 1:
-                self._finalize_trajectory()
-                self._enter_scanning_full_frame()
+                saved = self._finalize_trajectory()
+                if defer_detecting_throw:
+                    if saved:
+                        self._enter_awaiting_partner()
+                    else:
+                        self._mark_stereo_reconcile()
+                else:
+                    self._enter_scanning_full_frame()
             else:
-                if motion_mask is not None:
-                    detected_pos = self._find_ball(motion_mask)
+                detected_pos = self._find_ball_merged(motion_mask, alternate_motion_mask)
 
                 if detected_pos is not None:
                     self._scan_origin = detected_pos
                     self._trajectory_points.append(detected_pos)
+                    if frame_index is not None:
+                        self._trajectory_frames.append(frame_index)
                     self._miss_count = 0
                 else:
                     self._miss_count += 1
                     if self._miss_count >= self.timeout_frames:
-                        self._finalize_trajectory()
-                        self.phase = (
-                            Phase.AWAITING_PARTNER
-                            if defer_detecting_throw
-                            else Phase.DETECTING_THROW
-                        )
+                        saved = self._finalize_trajectory()
+                        if defer_detecting_throw:
+                            self._complete_throw_stereo(saved)
+                        else:
+                            self.phase = Phase.DETECTING_THROW
 
         return self._result_snapshot(detected_pos)
 
@@ -240,6 +432,12 @@ class TrajectoryTracker:
             trajectory_points=list(self._trajectory_points),
             completed_trajectory=self._completed_trajectory,
             fitted_curve_points=self._fitted_curve_points,
+            completed_parabola_fit=self._completed_parabola_fit,
+            completed_trajectory_frames=(
+                list(self._completed_trajectory_frames)
+                if self._completed_trajectory_frames is not None
+                else None
+            ),
             completed_tracking_frames=self._completed_tracking_frames,
             completion_id=self._completion_id,
         )
@@ -249,60 +447,84 @@ class TrajectoryTracker:
         self._scan_origin = wrist_pos
         self._full_frame_scan = False
         self._trajectory_points = []
+        self._trajectory_frames = []
         self._miss_count = 0
+        self._scan_frame_count = 0
 
     def _enter_scanning_full_frame(self) -> None:
         self.phase = Phase.SCANNING_BALL
         self._scan_origin = None
         self._full_frame_scan = True
         self._trajectory_points = []
+        self._trajectory_frames = []
         self._miss_count = 0
+        self._scan_frame_count = 0
 
-    def _finalize_trajectory(self) -> None:
-        """Fit a parabola to collected points and save the completed trajectory."""
+    def _enter_scanning_at_origin(self, origin: tuple[int, int]) -> None:
+        self.phase = Phase.SCANNING_BALL
+        self._scan_origin = origin
+        self._full_frame_scan = False
+        self._trajectory_points = []
+        self._trajectory_frames = []
+        self._miss_count = 0
+        self._scan_frame_count = 0
+
+    def _enter_awaiting_partner(self, *, valid_completion: bool = True) -> None:
+        self.phase = Phase.AWAITING_PARTNER
+        self._awaiting_frame_count = 0
+        self._awaiting_valid_completion = valid_completion
+        self._scan_origin = None
+        self._full_frame_scan = False
+
+    def _exit_scanning_failed(self, defer_detecting_throw: bool) -> None:
+        self._scan_origin = None
+        self._full_frame_scan = False
+        if defer_detecting_throw:
+            self._mark_stereo_reconcile()
+        else:
+            self.phase = Phase.DETECTING_THROW
+
+    def _finalize_trajectory(self) -> bool:
+        """Fit a parabola to collected points and save the completed trajectory.
+
+        Returns True when the trajectory was kept, False when discarded.
+        """
         points = self._trajectory_points
+        point_frames = self._trajectory_frames
         tracking_frames = self._tracking_frame_count
         self._trajectory_points = []
+        self._trajectory_frames = []
         self._tracking_frame_count = 0
 
         if len(points) < MIN_TRAJECTORY_POINTS:
-            return
+            return False
 
         self._completed_trajectory = list(points)
+        self._completed_trajectory_frames = (
+            list(point_frames) if len(point_frames) == len(points) else None
+        )
         self._fitted_curve_points = None
+        self._completed_parabola_fit = None
 
-        if len(points) >= 3:
-            xs = np.array([p[0] for p in points], dtype=np.float64)
-            ys = np.array([p[1] for p in points], dtype=np.float64)
-            x_range = xs.max() - xs.min()
-            y_range = ys.max() - ys.min()
-
-            try:
-                if x_range >= y_range:
-                    # y = f(x)
-                    coeffs = np.polyfit(xs, ys, 2)
-                    x_start = xs.min() - x_range * 0.15
-                    x_end = xs.max() + x_range * 0.15
-                    x_sample = np.linspace(x_start, x_end, 120)
-                    y_sample = np.polyval(coeffs, x_sample)
-                    self._fitted_curve_points = [
-                        (int(x), int(y)) for x, y in zip(x_sample, y_sample)
-                    ]
-                else:
-                    # x = f(y) – for near-vertical throws
-                    coeffs = np.polyfit(ys, xs, 2)
-                    y_start = ys.min() - y_range * 0.15
-                    y_end = ys.max() + y_range * 0.15
-                    y_sample = np.linspace(y_start, y_end, 120)
-                    x_sample = np.polyval(coeffs, y_sample)
-                    self._fitted_curve_points = [
-                        (int(x), int(y)) for x, y in zip(x_sample, y_sample)
-                    ]
-            except (np.linalg.LinAlgError, ValueError):
-                pass
+        fit = fit_parabola(points)
+        if fit is not None:
+            self._completed_parabola_fit = fit
+            self._fitted_curve_points = sample_parabola(fit, points)
 
         self._completed_tracking_frames = tracking_frames
         self._completion_id += 1
+        return True
+
+    def _find_ball_merged(
+        self,
+        motion_mask: np.ndarray | None,
+        alternate_motion_mask: np.ndarray | None = None,
+    ) -> tuple[int, int] | None:
+        """Prefer MOG2 (primary mask), then frame diff when both detect in the search area."""
+        primary = self._find_ball(motion_mask) if motion_mask is not None else None
+        if primary is not None or alternate_motion_mask is None:
+            return primary
+        return self._find_ball(alternate_motion_mask)
 
     def _find_ball(self, motion_mask: np.ndarray) -> tuple[int, int] | None:
         """Return the centroid of the largest circular contour in the search area."""

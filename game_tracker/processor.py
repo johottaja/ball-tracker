@@ -6,11 +6,19 @@ from typing import Callable
 
 import numpy as np
 
+from framesync import FrameSyncEngine
+from framesync.playback import prepare_framesync_for_frame, record_framesync_completion
 from throw_detection.inference import ThrowInference
 from trajectory_tracking import Phase, TrajectoryTracker
+from trajectory_tracking.stereo import reconcile_stereo_trackers
+from trajectory_tracking.release import (
+    find_release_point_from_cache,
+    find_secondary_release_at_frame,
+)
 from video_viewer.ball_motion import BallDetectionMethod, MotionMaskBuilder
 from video_viewer.config import THROW_MODEL_PATH
 from video_viewer.filters import _extract_wrist_pos
+from video_viewer.stereo_ball_detection import detect_stereo_balls
 
 from .config import GAME_JSON
 from .game_data import GameSession, Point2D, ThrowRecord, new_game_session, save_game
@@ -33,6 +41,7 @@ class GameTrackingProcessor:
         self._secondary_tracker = TrajectoryTracker()
         self._main_motion = MotionMaskBuilder()
         self._secondary_motion = MotionMaskBuilder()
+        self._framesync_engine = FrameSyncEngine()
         self._setup = CameraSetup()
         self._session: GameSession | None = None
         self._game_json_path = GAME_JSON
@@ -47,8 +56,13 @@ class GameTrackingProcessor:
         self._next_throw_id = 1
         self._frame_size: tuple[int, int] | None = None
         self._fps: float = 30.0
+        self._last_frame_index: int | None = None
 
         self.state = ProcessorState()
+
+    @property
+    def framesync_offset(self) -> float | None:
+        return self._framesync_engine.latest_offset
 
     def set_camera_setup(self, setup: CameraSetup) -> None:
         self._setup = setup
@@ -107,12 +121,14 @@ class GameTrackingProcessor:
         self._secondary_tracker.reset()
         self._main_motion.reset()
         self._secondary_motion.reset()
+        self._framesync_engine.reset()
         self._main_pending = []
         self._secondary_pending = []
         self._last_paired_main_completion_id = 0
         self._last_paired_secondary_completion_id = 0
         self._main_phase_prev = Phase.DETECTING_THROW
         self._secondary_phase_prev = Phase.DETECTING_THROW
+        self._last_frame_index = None
 
     def reset(self) -> None:
         self.reset_tracking()
@@ -126,16 +142,6 @@ class GameTrackingProcessor:
             return None
         self._throw_inference = ThrowInference(THROW_MODEL_PATH)
         return self._throw_inference
-
-    def _sync_stereo_phases(self) -> None:
-        main = self._main_tracker
-        secondary = self._secondary_tracker
-        if (
-            main.phase == Phase.AWAITING_PARTNER
-            and secondary.phase == Phase.AWAITING_PARTNER
-        ):
-            main.phase = Phase.DETECTING_THROW
-            secondary.phase = Phase.DETECTING_THROW
 
     def _maybe_reset_pending_on_scan(self, phase: Phase, prev: Phase, camera: str) -> Phase:
         if phase == Phase.SCANNING_BALL and prev != Phase.SCANNING_BALL:
@@ -155,7 +161,7 @@ class GameTrackingProcessor:
         if phase == Phase.TRACKING_BALL and detected_pos is not None:
             pending.append(Point2D(frame=frame_index, x=detected_pos[0], y=detected_pos[1]))
 
-    def _try_pair_throw(self) -> None:
+    def _try_pair_throw(self, cache: object | None = None) -> None:
         main_id = self._main_tracker._completion_id
         secondary_id = self._secondary_tracker._completion_id
         if (
@@ -174,6 +180,35 @@ class GameTrackingProcessor:
         if self._frame_size is None:
             return
 
+        frame_offset = self._framesync_engine.latest_offset
+
+        if cache is not None:
+            release = find_release_point_from_cache(
+                left_track,
+                self._main_tracker._completed_parabola_fit,
+                cache,
+            )
+            if release is not None:
+                left_track = [
+                    Point2D(frame=release.frame, x=release.x, y=release.y),
+                    *left_track,
+                ]
+                secondary_release = find_secondary_release_at_frame(
+                    right_track,
+                    self._secondary_tracker._completed_parabola_fit,
+                    release.frame,
+                    timeline_offset=frame_offset or 0.0,
+                )
+                if secondary_release is not None:
+                    right_track = [
+                        Point2D(
+                            frame=secondary_release.frame,
+                            x=secondary_release.x,
+                            y=secondary_release.y,
+                        ),
+                        *right_track,
+                    ]
+
         throw = triangulate_throw(
             left_track,
             right_track,
@@ -181,6 +216,7 @@ class GameTrackingProcessor:
             frame_size=self._frame_size,
             fps=self._fps,
             throw_id=self._next_throw_id,
+            frame_offset=frame_offset,
         )
         if throw is None:
             return
@@ -207,11 +243,13 @@ class GameTrackingProcessor:
         *,
         frame_index: int,
         main_warmup_frames: list[np.ndarray] | None = None,
+        main_warmup_start_index: int | None = None,
         main_previous_frame: np.ndarray | None = None,
         main_mog2_warmup_frames: list[np.ndarray] | None = None,
         secondary_previous_frame: np.ndarray | None = None,
         secondary_mog2_warmup_frames: list[np.ndarray] | None = None,
         video_fps: float | None = None,
+        cache: object | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         if video_fps is not None and video_fps > 0:
             self._fps = video_fps
@@ -222,63 +260,105 @@ class GameTrackingProcessor:
         if main_warmup_frames is not None:
             self.reset_tracking()
 
+        self._last_frame_index = prepare_framesync_for_frame(
+            self._framesync_engine,
+            frame_index,
+            self._last_frame_index,
+            cache,
+        )
+
+        detection = detect_stereo_balls(
+            self._main_motion,
+            self._secondary_motion,
+            main_frame,
+            secondary_frame,
+            main_previous_frame=main_previous_frame,
+            main_mog2_warmup_frames=main_mog2_warmup_frames,
+            secondary_previous_frame=secondary_previous_frame,
+            secondary_mog2_warmup_frames=secondary_mog2_warmup_frames,
+            main_cache=cache.main if cache is not None else None,
+            secondary_cache=cache.secondary if cache is not None else None,
+            frame_index=frame_index,
+        )
+
+        sync_id_before = self._framesync_engine.sync_id
+        self._framesync_engine.update(
+            frame_index,
+            detection.main.ball_bottom,
+            detection.secondary.ball_bottom,
+            video_fps=video_fps,
+        )
+        record_framesync_completion(
+            self._framesync_engine,
+            frame_index,
+            sync_id_before,
+            cache,
+        )
+
         inference = self._ensure_throw_inference()
         if inference is None:
-            self._main_motion.build_mask(main_frame, main_previous_frame)
-            self._secondary_motion.build_mask(
-                secondary_frame, secondary_previous_frame
-            )
             return main_frame.copy(), secondary_frame.copy()
 
-        prediction = inference.predict(main_frame, warmup_frames=main_warmup_frames)
-        throw_label = prediction.label
-
-        main_motion_mask = self._main_motion.build_mask(
+        prediction = inference.predict(
             main_frame,
-            main_previous_frame,
-            mog2_warmup_frames=main_mog2_warmup_frames,
+            warmup_frames=main_warmup_frames,
+            warmup_start_index=main_warmup_start_index,
+            cache=cache.main if cache is not None else None,
+            frame_index=frame_index,
         )
-        secondary_motion_mask = self._secondary_motion.build_mask(
-            secondary_frame,
-            secondary_previous_frame,
-            mog2_warmup_frames=secondary_mog2_warmup_frames,
-        )
+        throw_label = prediction.label
 
         main_result = self._main_tracker.update(
             throw_label=throw_label,
             wrist_pos=_extract_wrist_pos(prediction.detection),
-            motion_mask=main_motion_mask,
+            motion_mask=detection.main.motion_mask,
+            alternate_motion_mask=detection.main.alternate_motion_mask,
             defer_detecting_throw=True,
+            frame_index=frame_index,
         )
         secondary_result = self._secondary_tracker.update_secondary(
             throw_label=throw_label,
-            motion_mask=secondary_motion_mask,
+            motion_mask=detection.secondary.motion_mask,
+            alternate_motion_mask=detection.secondary.alternate_motion_mask,
             defer_detecting_throw=True,
+            frame_index=frame_index,
         )
-        self._sync_stereo_phases()
+        main_reconciled, secondary_reconciled = reconcile_stereo_trackers(
+            self._main_tracker,
+            self._secondary_tracker,
+            throw_label=throw_label,
+            wrist_pos=_extract_wrist_pos(prediction.detection),
+        )
+        if main_reconciled:
+            self._main_pending = []
+        if secondary_reconciled:
+            self._secondary_pending = []
+
+        main_phase = self._main_tracker.phase
+        secondary_phase = self._secondary_tracker.phase
 
         self._main_phase_prev = self._maybe_reset_pending_on_scan(
-            main_result.phase, self._main_phase_prev, "main"
+            main_phase, self._main_phase_prev, "main"
         )
         self._secondary_phase_prev = self._maybe_reset_pending_on_scan(
-            secondary_result.phase, self._secondary_phase_prev, "secondary"
+            secondary_phase, self._secondary_phase_prev, "secondary"
         )
-        self._main_phase_prev = main_result.phase
-        self._secondary_phase_prev = secondary_result.phase
+        self._main_phase_prev = main_phase
+        self._secondary_phase_prev = secondary_phase
 
         self._capture_detection(
-            main_result.phase,
+            main_phase,
             main_result.detected_ball_pos,
             frame_index,
             self._main_pending,
         )
         self._capture_detection(
-            secondary_result.phase,
+            secondary_phase,
             secondary_result.detected_ball_pos,
             frame_index,
             self._secondary_pending,
         )
 
-        self._try_pair_throw()
+        self._try_pair_throw(cache=cache.main if cache is not None else None)
 
         return main_frame.copy(), secondary_frame.copy()

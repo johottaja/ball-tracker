@@ -33,6 +33,11 @@ class FrameSyncEngine:
         self._secondary_joined = False
         self._cooldown_until_frame = None
 
+    def restore_persisted_sync(self, *, offset: float, sync_id: int) -> None:
+        """Restore offset measured earlier in playback (after a seek reset)."""
+        self._latest_offset = offset
+        self._sync_id = sync_id
+
     @property
     def latest_offset(self) -> float | None:
         return self._latest_offset

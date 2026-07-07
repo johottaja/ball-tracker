@@ -4,7 +4,12 @@ import cv2
 import numpy as np
 from PIL import ImageTk
 
-from .ball_motion import BallDetectionMethod
+from .ball_motion import (
+    BallDetectionMethod,
+    HYBRID_METHODS,
+    uses_frame_diff_component,
+    uses_mog2_component,
+)
 from .config import MOG2_HISTORY
 from .display import frame_to_photo
 from .filters import BALL_MASK_FILTER_IDS, FilterId, FrameFilter
@@ -92,38 +97,114 @@ def gru_warmup_frames_if_needed(
     return warmup_frames_for_gru(cap, index, buffer_size)
 
 
+def _frame_diff_mask_cached(cache: object | None, index: int) -> bool:
+    return (
+        cache is not None
+        and cache.has_motion_mask(BallDetectionMethod.FRAME_DIFF, index)
+    )
+
+
+def _mog2_mask_cached(cache: object | None, index: int) -> bool:
+    return (
+        cache is not None
+        and cache.has_motion_mask(BallDetectionMethod.MOG2_CLOSING, index)
+    )
+
+
+def ball_mask_playback_inputs(
+    cap: cv2.VideoCapture,
+    method: BallDetectionMethod,
+    index: int,
+    mog2_stream_frame_index: int | None,
+    cache: object | None = None,
+) -> tuple[np.ndarray | None, list[np.ndarray] | None]:
+    previous: np.ndarray | None = None
+    mog2_warmup: list[np.ndarray] | None = None
+
+    if uses_frame_diff_component(method) and not _frame_diff_mask_cached(cache, index):
+        previous = previous_frame_for_diff(cap, index)
+
+    if method == BallDetectionMethod.MOG2_CLOSING:
+        if cache is None or not cache.has_motion_mask(method, index):
+            mog2_warmup = mog2_warmup_frames_if_needed(
+                cap, index, mog2_stream_frame_index
+            )
+    elif method in HYBRID_METHODS and not _mog2_mask_cached(cache, index):
+        mog2_warmup = mog2_warmup_frames_if_needed(
+            cap, index, mog2_stream_frame_index
+        )
+
+    return previous, mog2_warmup
+
+
+def stereo_ball_mask_playback_inputs(
+    left_cap: cv2.VideoCapture,
+    right_cap: cv2.VideoCapture,
+    method: BallDetectionMethod,
+    index: int,
+    left_mog2_stream_frame_index: int | None,
+    right_mog2_stream_frame_index: int | None,
+    left_cache: object | None = None,
+    right_cache: object | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, list[np.ndarray] | None, list[np.ndarray] | None]:
+    left_previous, left_mog2_warmup = ball_mask_playback_inputs(
+        left_cap,
+        method,
+        index,
+        left_mog2_stream_frame_index,
+        left_cache,
+    )
+    right_previous, right_mog2_warmup = ball_mask_playback_inputs(
+        right_cap,
+        method,
+        index,
+        right_mog2_stream_frame_index,
+        right_cache,
+    )
+    return left_previous, right_previous, left_mog2_warmup, right_mog2_warmup
+
+
 def filter_inputs_for_playback(
     cap: cv2.VideoCapture,
     frame_filter: FrameFilter,
     index: int,
     gru_stream_frame_index: int | None,
     mog2_stream_frame_index: int | None = None,
-) -> tuple[np.ndarray | None, list[np.ndarray] | None, list[np.ndarray] | None]:
+    cache: object | None = None,
+) -> tuple[np.ndarray | None, list[np.ndarray] | None, list[np.ndarray] | None, int | None]:
     previous: np.ndarray | None = None
     mog2_warmup: list[np.ndarray] | None = None
     warmup_frames: list[np.ndarray] | None = None
+    warmup_start_index: int | None = None
 
     if frame_filter.filter_id in BALL_MASK_FILTER_IDS:
-        if frame_filter.ball_detection_method == BallDetectionMethod.FRAME_DIFF:
-            previous = previous_frame_for_diff(cap, index)
-        else:
-            mog2_warmup = mog2_warmup_frames_if_needed(
-                cap, index, mog2_stream_frame_index
-            )
+        previous, mog2_warmup = ball_mask_playback_inputs(
+            cap,
+            frame_filter.ball_detection_method,
+            index,
+            mog2_stream_frame_index,
+            cache,
+        )
 
     if frame_filter.filter_id in (
         FilterId.GRU_THROW_INFERENCE,
         FilterId.TRAJECTORY_TRACKING,
         FilterId.STEREO_TRACKING,
     ):
-        warmup_frames = gru_warmup_frames_if_needed(
-            cap,
-            index,
-            gru_stream_frame_index,
-            frame_filter.throw_buffer_size(),
-        )
+        gru_cached = cache is not None and cache.has_gru(index)
+        if not gru_cached:
+            warmup_frames = gru_warmup_frames_if_needed(
+                cap,
+                index,
+                gru_stream_frame_index,
+                frame_filter.throw_buffer_size(),
+            )
+            if warmup_frames is not None:
+                warmup_start_index = max(
+                    0, index - frame_filter.throw_buffer_size() + 1
+                )
 
-    return previous, mog2_warmup, warmup_frames
+    return previous, mog2_warmup, warmup_frames, warmup_start_index
 
 
 def apply_filter_to_frame(
@@ -133,14 +214,20 @@ def apply_filter_to_frame(
     previous_frame: np.ndarray | None = None,
     mog2_warmup_frames: list[np.ndarray] | None = None,
     warmup_frames: list[np.ndarray] | None = None,
+    warmup_start_index: int | None = None,
     video_fps: float | None = None,
+    frame_index: int | None = None,
+    cache: object | None = None,
 ) -> np.ndarray:
     return frame_filter.apply(
         frame,
         previous_frame=previous_frame,
         mog2_warmup_frames=mog2_warmup_frames,
         warmup_frames=warmup_frames,
+        warmup_start_index=warmup_start_index,
         video_fps=video_fps,
+        frame_index=frame_index,
+        cache=cache,
     )
 
 
@@ -152,7 +239,10 @@ def frame_to_display_photo(
     previous_frame: np.ndarray | None = None,
     mog2_warmup_frames: list[np.ndarray] | None = None,
     warmup_frames: list[np.ndarray] | None = None,
+    warmup_start_index: int | None = None,
     video_fps: float | None = None,
+    frame_index: int | None = None,
+    cache: object | None = None,
 ) -> ImageTk.PhotoImage:
     filtered = apply_filter_to_frame(
         frame_filter,
@@ -160,9 +250,47 @@ def frame_to_display_photo(
         previous_frame=previous_frame,
         mog2_warmup_frames=mog2_warmup_frames,
         warmup_frames=warmup_frames,
+        warmup_start_index=warmup_start_index,
         video_fps=video_fps,
+        frame_index=frame_index,
+        cache=cache,
     )
     return frame_to_photo(filtered, display_size)
+
+
+def gru_warmup_for_playback(
+    cap: cv2.VideoCapture,
+    index: int,
+    gru_stream_frame_index: int | None,
+    buffer_size: int,
+    cache: object | None = None,
+) -> tuple[list[np.ndarray] | None, int | None]:
+    if cache is not None and cache.has_gru(index):
+        return None, None
+    warmup_frames = gru_warmup_frames_if_needed(
+        cap, index, gru_stream_frame_index, buffer_size
+    )
+    if warmup_frames is None:
+        return None, None
+    return warmup_frames, max(0, index - buffer_size + 1)
+
+
+def mog2_warmup_for_playback(
+    cap: cv2.VideoCapture,
+    index: int,
+    mog2_stream_frame_index: int | None,
+    cache: object | None = None,
+    *,
+    method: BallDetectionMethod = BallDetectionMethod.MOG2_CLOSING,
+) -> list[np.ndarray] | None:
+    if method == BallDetectionMethod.FRAME_DIFF:
+        return None
+    if method == BallDetectionMethod.MOG2_CLOSING:
+        if cache is not None and cache.has_motion_mask(method, index):
+            return None
+    elif cache is not None and _mog2_mask_cached(cache, index):
+        return None
+    return mog2_warmup_frames_if_needed(cap, index, mog2_stream_frame_index)
 
 
 def uses_gru_streaming(frame_filter: FrameFilter) -> bool:
@@ -175,6 +303,6 @@ def uses_gru_streaming(frame_filter: FrameFilter) -> bool:
 
 def uses_mog2_streaming(frame_filter: FrameFilter) -> bool:
     return (
-        frame_filter.ball_detection_method == BallDetectionMethod.MOG2_CLOSING
+        uses_mog2_component(frame_filter.ball_detection_method)
         and frame_filter.filter_id in BALL_MASK_FILTER_IDS
     )

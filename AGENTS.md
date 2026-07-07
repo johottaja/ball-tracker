@@ -90,8 +90,9 @@ balltracker/
 │   └── models/               # Saved GRU checkpoints (gitignored)
 ├── trajectory_tracking/      # Ball trajectory tracker
 │   ├── __init__.py
-│   ├── config.py             # sector, tracking, torso/speed constants
+│   ├── config.py             # sector, tracking, torso/speed, release-backtrack constants
 │   ├── speed.py              # TorsoLengthBuffer, curve-length speed estimate
+│   ├── release.py            # palm estimate, parabola backtrack to release point
 │   ├── tracker.py            # Phase enum, TrajectoryResult, TrajectoryTracker
 │   └── drawing.py            # draw_trajectory_overlay (sector, points, parabola, speed)
 ├── framesync/                # Stereo frame-offset from ball drop/bounce
@@ -100,6 +101,7 @@ balltracker/
 │   ├── types.py              # Phase, BallSample, FrameSyncResult
 │   ├── tracker.py            # CameraSyncTracker (per-camera state machine)
 │   ├── engine.py             # FrameSyncEngine (stereo session + offset math)
+│   ├── playback.py           # Seek reset + sync-event cache helpers for playback
 │   ├── subframe.py           # estimate_bounce_subframe_index
 │   └── drawing.py            # draw_framesync_overlay (sync label, phase)
 ├── stereo_viewer/            # Dual-camera viewer (side-by-side)
@@ -139,6 +141,7 @@ balltracker/
     ├── filters.py            # Filter registry and FrameFilter pipeline
     ├── ball_motion.py        # BallDetectionMethod, MotionMaskBuilder (MOG2 / frame diff)
     ├── ball_detection.py     # Contour/circularity logic and ball overlays
+    ├── stereo_ball_detection.py # Shared stereo mask + full-frame ball-bottom detection
     ├── pose_overlay.py       # Dominant-hand skeleton overlay for the viewer filter
     └── recordings/           # Viewer default save dir (gitignored)
 ```
@@ -178,7 +181,7 @@ balltracker/
 | `camera.py` | Open cameras (AVFoundation on macOS), probe indices, enforce min FPS; `CameraReader` captures on a background thread |
 | `config.py` | `RECORDINGS_DIR`, ball-motion thresholds (MOG2, frame diff), pose overlay drawing sizes |
 | `filters.py` | `FilterId` enum, `FrameFilter` state |
-| `ball_motion.py` | `BallDetectionMethod`, `MotionMaskBuilder` — MOG2 + closing or frame diff masks |
+| `ball_motion.py` | `BallDetectionMethod`, `MotionMaskBuilder` — MOG2, frame diff, hybrid, and hybrid-stacked masks |
 | `ball_detection.py` | Circular contour filtering, largest-ball selection, `contour_bottom_center`, drawing |
 | `pose_overlay.py` | Throw / normalized-throw / GRU-inference filter overlays (imports `pose_detection`, `throw_detection.inference`) |
 | `recording.py` | Create MP4 writer; `extend_video_evenly` re-encodes a clip with evenly distributed duplicate frames |
@@ -198,7 +201,7 @@ balltracker/
 | `tracker.py` | `TrajectoryTracker` — three-phase state machine (detecting throw → scanning ball → tracking ball); fits parabola on trajectory exit; counts tracking frames per throw |
 | `speed.py` | `TorsoLengthBuffer` (10-frame rolling mean of shoulder→hip px); `estimate_throw_speed_m_s` from fitted curve length × torso scale ÷ tracking duration |
 | `drawing.py` | `draw_trajectory_overlay` — sector wedge, ball markers, active/completed points, fitted parabola, phase label, completed throw speed (top-right) |
-| `config.py` | `SECTOR_ANGLE_DEG`, `SECTOR_DIRECTION_DEG`, `SECTOR_RADIUS_PX`, `TRACKING_TIMEOUT_FRAMES`, `BALL_CIRCULARITY_MIN/MAX`, `ASSUMED_TORSO_CM`, `TORSO_LENGTH_BUFFER_SIZE` |
+| `config.py` | `SECTOR_ANGLE_DEG`, `SECTOR_DIRECTION_DEG`, `SECTOR_RADIUS_PX`, `TRACKING_TIMEOUT_FRAMES`, `BALL_CIRCULARITY_MIN/MAX` (0.4–1.0), `ASSUMED_TORSO_CM`, `TORSO_LENGTH_BUFFER_SIZE` |
 | **framesync** | |
 | `tracker.py` | `CameraSyncTracker` — per-camera phases: watching → syncing → capturing → done |
 | `engine.py` | `FrameSyncEngine` — pairs sync sessions across cameras, computes offset when both finish |
@@ -214,7 +217,11 @@ Both viewers expose a **Ball detection** dropdown (independent of the display fi
 
 **Frame diff:** `current − previous`, brightness amplification (`DIFF_BRIGHTNESS_FACTOR`), threshold (`DIFF_THRESH_VALUE`), morphological open (`FRAME_DIFF_MORPH_KERNEL_SIZE`). Needs the previous frame (or sequential streaming state).
 
-Shared contour step (both methods):
+**Hybrid:** runs MOG2 and frame diff independently; each does its own contour detection. Ball position merges at the detection level — if both find a ball in the search area, MOG2 wins; otherwise either method’s hit is used. Used by trajectory/stereo tracking via `alternate_motion_mask`. **Contours** draws circular contours from both masks on an OR background.
+
+**Hybrid stacked:** bitwise-OR (`cv2.bitwise_or`) of the MOG2 and frame-diff masks, then standard single-mask contour detection. Behaves like one combined motion mask everywhere.
+
+Shared contour step (all methods):
 
 1. **Contour detection** — external contours on the binary mask
 2. **Circularity filter** — reject non-ball shapes via `BALL_CIRCULARITY_MIN/MAX`
@@ -264,10 +271,12 @@ The video viewer **GRU throw inference** filter (`FilterId.GRU_THROW_INFERENCE`)
 `TrajectoryTracker` is a three-phase state machine called once per frame:
 
 1. **DETECTING_THROW** — waits for `throw_label == 1` from the GRU inference. When detected, moves to phase 2 using the wrist position as the sector origin.
-2. **SCANNING_BALL** — on every frame, re-anchors the sector at the wrist if the throw label is still 1. Searches the motion mask for the largest circular contour whose centroid lies inside a circular sector: `sector_radius` pixels from the wrist, centered on the elbow→wrist arm direction, ±`sector_half_angle` degrees wide. When a contour is found, transitions to phase 3.
+2. **SCANNING_BALL** — on every frame while the throw label is 1, re-anchors the sector at the wrist and pauses the scan timer. Searches the motion mask for the largest circular contour whose centroid lies inside a circular sector: `sector_radius` pixels from the wrist, centered on the elbow→wrist arm direction, ±`sector_half_angle` degrees wide. When a contour is found, transitions to phase 3. After the throw label returns to 0, exits if no ball was found within `SCANNING_TIMEOUT_FRAMES` (stereo: follow partner; mono: `DETECTING_THROW`).
 3. **TRACKING_BALL** — records ball centroid positions. Each frame the sector is re-centered on the last detection and the direction is updated to the previous→current ball vector. If `timeout_frames` consecutive frames yield no detection, the trajectory is finalised: `numpy.polyfit` fits a degree-2 polynomial (y=f(x) or x=f(y) depending on aspect ratio) and 120 sampled curve points are stored. The tracker then returns to phase 1.
 
 A new throw label while in phase 3 immediately finalises the current trajectory and re-enters phase 2.
+
+**Release backtrack (after finalize):** On the main camera, the fitted parabola is walked backward frame-by-frame through cached YOLO pose. Palm position is estimated as `elbow + PALM_EXTENSION × (wrist − elbow)` (default 1.2). The frame with minimum trajectory–palm distance within the GRU throw window is prepended as the release point. The secondary camera extrapolates its parabola to the same frame. Used in `game_tracker` JSON export and stereo/mono playback overlays when pose cache is available.
 
 **Display (`FilterId.TRAJECTORY_TRACKING`):** renders all GRU inference overlays (pose skeleton, logit readout, label badge) plus:
 - Sector wedge outline (yellow-orange in phase 2, green in phase 3) at the current scan origin.
@@ -277,7 +286,7 @@ A new throw label while in phase 3 immediately finalises the current trajectory 
 - Phase label text in the top-left corner.
 - After a throw is fully tracked: speed readout in the top-right (`X.X m/s  Y.Y km/h`), inferred from fitted curve length × torso scale (50 cm assumed shoulder→hip, 10-frame rolling mean) ÷ tracking frame count at the video file's FPS (playback mode only).
 
-**Stereo viewer (`FilterId.STEREO_TRACKING`, stereo viewer only):** left (main) camera runs GRU throw inference (pose skeleton, logit, label badge) plus wrist-anchored ball tracking. The right (secondary) camera runs ball tracking only, driven by the main throw label (full-frame scan, then sector follow). Both panels show trajectory overlays. Throw detection is not run on the secondary camera. Trajectories with fewer than `MIN_TRAJECTORY_POINTS` detected positions are discarded so brief GRU flickers do not replace a completed throw. A camera that finishes tracking waits in `awaiting_partner` until the other camera also ends before both return to `detecting_throw`.
+**Stereo viewer (`FilterId.STEREO_TRACKING`, stereo viewer only):** left (main) camera runs GRU throw inference (pose skeleton, logit, label badge) plus wrist-anchored ball tracking. The right (secondary) camera runs ball tracking only, driven by the main throw label (full-frame scan, then sector follow). Both panels show trajectory overlays plus framesync overlay (phase label, ±offset badge). Ball motion masks and full-frame ball-bottom detection are shared with the framesync engine via `video_viewer.stereo_ball_detection` (no duplicate mask work). Throw detection is not run on the secondary camera. Trajectories with fewer than `MIN_TRAJECTORY_POINTS` detected positions are discarded so brief GRU flickers do not replace a completed throw. A failed camera (discarded trajectory or scan timeout) immediately adopts the partner's phase instead of blocking in `awaiting_partner`. Valid completions wait in `awaiting_partner` until the partner also completes or `AWAITING_PARTNER_TIMEOUT_FRAMES` elapses; when both are awaiting on the same frame, both return to `detecting_throw` immediately.
 
 Tune via `trajectory_tracking/config.py`: `SECTOR_ANGLE_DEG`, `SECTOR_DIRECTION_DEG`, `SECTOR_RADIUS_PX`, `TRACKING_TIMEOUT_FRAMES`, `MIN_TRAJECTORY_POINTS`, `BALL_CIRCULARITY_MIN/MAX`, `ASSUMED_TORSO_CM`, `TORSO_LENGTH_BUFFER_SIZE`.
 
@@ -285,13 +294,13 @@ Tune via `trajectory_tracking/config.py`: `SECTOR_ANGLE_DEG`, `SECTOR_DIRECTION_
 
 Production app for recording a beer pong session and exporting 3D throw trajectories to JSON.
 
-**UI:** Same record/playback/camera-selection shell as `stereo_viewer`, but **no display filters**. Ball detection method combobox only (MOG2 + closing or frame diff). **Camera setup…** button opens a popup for geometry fields (distances, heights, inter-camera angle, horizontal FOV). Settings persist in `game_tracker/camera_setup.json` (auto-loaded on startup, saved on dialog Save and app close).
+**UI:** Same record/playback/camera-selection shell as `stereo_viewer`, but **no display filters**. Ball detection method combobox only (MOG2 + closing, frame diff, hybrid, or hybrid stacked). **Camera setup…** button opens a popup for geometry fields (distances, heights, inter-camera angle, horizontal FOV). Settings persist in `game_tracker/camera_setup.json` (auto-loaded on startup, saved on dialog Save and app close).
 
 **Recording:** Raw frames to `game_tracker/recordings/left.mp4` and `right.mp4`. On stop, `extend_video_evenly` matches the shorter clip to the longer (same procedure as `stereo_viewer`). Fresh `game.json` session header written on stop.
 
-**Tracking (`GameTrackingProcessor`):** Always active during live preview and playback. Main (left) camera: GRU throw inference + wrist-anchored ball tracking. Secondary (right): ball tracking driven by main throw label. Stereo phase gate (`AWAITING_PARTNER`) pairs throws across cameras. Frame-indexed 2D detections captured during `TRACKING_BALL`; when both cameras complete a throw, `triangulate_throw` produces a `ThrowRecord` appended to `game.json`.
+**Tracking (`GameTrackingProcessor`):** Active during playback (live record shows raw frames). Main (left) camera: GRU throw inference + wrist-anchored ball tracking. Secondary (right): ball tracking driven by main throw label. Stereo phase gate (`AWAITING_PARTNER`) pairs valid completions across cameras; failed tracks adopt the partner phase via `trajectory_tracking.stereo.reconcile_stereo_trackers`. Shared stereo ball detection (`video_viewer.stereo_ball_detection`) feeds both trajectory tracking and an embedded `FrameSyncEngine`. Frame-indexed 2D detections captured during `TRACKING_BALL`; when both cameras complete a throw, `triangulate_throw` pairs left/right points using the measured framesync offset (linear interpolation on the secondary track).
 
-**3D coordinate system:** Origin at table center; X along table length, Y along width, Z up from table (meters). Primary camera at `(0, −D_main, H_main)` looking at center (middle of one short end, 90° to table). Secondary at azimuth `−90° + camera_angle_deg`, distance `D_sec`, height `H_sec`, also look-at center. Shared pinhole intrinsics from frame width and `horizontal_fov_deg`. Per-point triangulation via `cv2.triangulatePoints` on matching frame indices (equalized clips — no `framesync` offset). 3D speed from fitted curve arc length ÷ throw duration.
+**3D coordinate system:** Origin at table center; X along table length, Y along width, Z up from table (meters). Primary camera at `(0, −D_main, H_main)` looking at center (middle of one short end, 90° to table). Secondary at azimuth `−90° + camera_angle_deg`, distance `D_sec`, height `H_sec`, also look-at center. Shared pinhole intrinsics from frame width and `horizontal_fov_deg`. Per-point triangulation via `cv2.triangulatePoints` on temporally aligned 2D pairs (`secondary_frame = main_frame + offset` when offset is known). 3D speed from fitted curve arc length ÷ throw duration.
 
 **`game.json` schema (version 1):** `recorded_at`, `fps`, `frame_count`, `videos`, `camera_setup`, `coordinate_system`, `throws[]` with `id`, `start_frame`, `end_frame`, `points_3d`, `fitted_curve_3d`, `speed_m_s`, `tracks_2d` (left/right pixel tracks). Designed for consumption by a future React SPA.
 
@@ -306,9 +315,9 @@ Measures stereo camera desync from a deliberate **sync action**: drop the ball s
 3. **CAPTURING** — after bounce on this feed, record `POST_BOUNCE_CAPTURE_FRAMES` (default 3) more samples independently.
 4. **DONE** — hold samples until the partner camera also finishes.
 
-**Stereo session (`FrameSyncEngine`):** first camera entering `SYNCING` opens a session; partner must join within `SYNC_PAIRING_WINDOW_FRAMES`. Bounce and capture run on independent per-camera timelines (feeds may be many frames apart). When both reach `DONE`, `estimate_bounce_subframe_index` finds each bounce time to 2 decimal places; `offset = secondary_bounce − main_bounce`. Display: main `+offset`, secondary `−offset`. Most recent offset persists until the next successful sync.
+**Stereo session (`FrameSyncEngine`):** first camera entering `SYNCING` opens a session; partner must join within `SYNC_PAIRING_WINDOW_FRAMES`. Bounce and capture run on independent per-camera timelines (feeds may be many frames apart). When both reach `DONE`, `estimate_bounce_subframe_index` finds each bounce time to 2 decimal places; `offset = secondary_bounce − main_bounce`. Display: main `+offset`, secondary `−offset`. Most recent offset persists until the next successful sync. On playback seeks, `framesync.playback` restores the latest cached offset from `PlaybackCache` sync events.
 
-**Display (`FilterId.FRAME_SYNC`, stereo viewer only):** ball detection rectangle, phase label (top-left), large sync label (top-center, `+X.XX` / `−X.XX` or `--`). No pose/GRU dependency.
+**Display (`FilterId.FRAME_SYNC`, stereo viewer only):** ball detection rectangle, phase label (top-left), large sync label (top-center, `+X.XX` / `−X.XX` or `--`). No pose/GRU dependency. Uses the same `video_viewer.stereo_ball_detection` helper as **Stereo tracking**.
 
 Tune via `framesync/config.py`: `DROP_STREAK_FRAMES`, `MAX_HORIZONTAL_DELTA_PX`, `POST_BOUNCE_CAPTURE_FRAMES`, `SLOWDOWN_RATIO`, `MIN_DOWNWARD_VY`, `SYNC_TIMEOUT_FRAMES`, `SYNC_PAIRING_WINDOW_FRAMES`, `SYNC_COOLDOWN_SECONDS`.
 
@@ -351,11 +360,14 @@ Tune via `framesync/config.py`: `DROP_STREAK_FRAMES`, `MAX_HORIZONTAL_DELTA_PX`,
 **`trajectory_tracking/config.py`**
 
 - **Sector:** `SECTOR_ANGLE_DEG` (full angular width, default 150°), `SECTOR_DIRECTION_DEG` (sector center direction, default 135° = left tilted 45° downward), `SECTOR_RADIUS_PX` (max search distance in pixels, default 400)
-- **Tracking:** `TRACKING_TIMEOUT_FRAMES` (consecutive miss frames before trajectory is finalised, default 3)
-- **Circularity:** `BALL_CIRCULARITY_MIN / MAX` (same defaults as ball detection: 0.5–1.0)
+- **Tracking:** `TRACKING_TIMEOUT_FRAMES` (consecutive miss frames before trajectory is finalised, default 5)
+- **Scan timeout:** `SCANNING_TIMEOUT_FRAMES` (default 10) — consecutive frames in `SCANNING_BALL` with throw label 0 and no ball detection
+- **Partner wait:** `AWAITING_PARTNER_TIMEOUT_FRAMES` (default 10) — max frames in `AWAITING_PARTNER` before returning to idle (incl. discarded throws)
+- **Circularity:** `BALL_CIRCULARITY_MIN / MAX` in `trajectory_tracking/config.py` (defaults 0.4–1.0; re-exported from `video_viewer/config.py` for ball detection)
 - **Minimum area:** `BALL_CONTOUR_MIN_AREA` (default 100 px²)
 - **Minimum length:** `MIN_TRAJECTORY_POINTS` (default 5) — shorter tracks are discarded
 - **Speed:** `ASSUMED_TORSO_CM` (default 50), `TORSO_LENGTH_BUFFER_SIZE` (default 10)
+- **Release backtrack:** `PALM_EXTENSION` (default 1.2), `RELEASE_MAX_LOOKBACK_FRAMES` (default 45), `RELEASE_HIT_RADIUS_FACTOR` (default 0.35 × forearm length)
 
 **`framesync/config.py`**
 
