@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import cv2
 import numpy as np
 
 from .config import (
     POSE_CONF_THRESHOLD,
     POSE_DEVICE,
+    POSE_INFERENCE_MAX_SIZE,
     POSE_KEYPOINT_MIN_CONF,
     POSE_MODEL_PATH,
 )
@@ -16,6 +18,39 @@ _HAND_JOINTS: dict[HandSide, tuple[tuple[str, int], ...]] = {
     "right": (("shoulder", 6), ("elbow", 8), ("wrist", 10)),
 }
 _HIP_INDICES: dict[HandSide, int] = {"left": 11, "right": 12}
+
+
+def _prepare_inference_frame(
+    frame: np.ndarray,
+    max_size: int = POSE_INFERENCE_MAX_SIZE,
+) -> tuple[np.ndarray, float, float]:
+    """Downscale for YOLO and return per-axis scale factors to map coords back."""
+    height, width = frame.shape[:2]
+    if max_size <= 0 or max(width, height) <= max_size:
+        return frame, 1.0, 1.0
+
+    scale = max_size / max(width, height)
+    new_width = max(1, int(round(width * scale)))
+    new_height = max(1, int(round(height * scale)))
+    resized = cv2.resize(
+        frame,
+        (new_width, new_height),
+        interpolation=cv2.INTER_AREA,
+    )
+    return resized, width / new_width, height / new_height
+
+
+def _scale_keypoints(
+    keypoints: np.ndarray,
+    scale_x: float,
+    scale_y: float,
+) -> np.ndarray:
+    if scale_x == 1.0 and scale_y == 1.0:
+        return keypoints
+    scaled = keypoints.copy()
+    scaled[:, 0] *= scale_x
+    scaled[:, 1] *= scale_y
+    return scaled
 
 
 class PoseDetector:
@@ -33,18 +68,24 @@ class PoseDetector:
 
     def detect(self, frame: np.ndarray) -> list[np.ndarray]:
         """Return keypoint arrays shaped (17, 3) as x, y, confidence per person."""
+        inference_frame, scale_x, scale_y = _prepare_inference_frame(frame)
         model = self._ensure_model()
         results = model(
-            frame,
+            inference_frame,
             conf=POSE_CONF_THRESHOLD,
             device=POSE_DEVICE,
             verbose=False,
+            imgsz=max(inference_frame.shape[:2]),
         )
         if not results or results[0].keypoints is None:
             return []
 
         keypoints = results[0].keypoints.data.cpu().numpy()
-        return [person for person in keypoints if person.shape[0] >= 17]
+        return [
+            _scale_keypoints(person, scale_x, scale_y)
+            for person in keypoints
+            if person.shape[0] >= 17
+        ]
 
 
 def _frame_center(frame: np.ndarray) -> tuple[float, float]:

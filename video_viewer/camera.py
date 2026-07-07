@@ -121,7 +121,7 @@ def probe_cameras(max_index: int = MAX_CAMERA_PROBE) -> list[CameraDevice]:
     return available
 
 
-FrameConsumer = Callable[["np.ndarray"], None]
+FrameConsumer = Callable[["np.ndarray", float], None]
 
 
 class CameraReader:
@@ -176,11 +176,12 @@ class CameraReader:
                 continue
 
             frame_copy = frame.copy()
+            captured_at = time.monotonic()
             with self._lock:
                 consumer = self._consumer
 
             if consumer is not None:
-                consumer(frame_copy)
+                consumer(frame_copy, captured_at)
 
             with self._lock:
                 self._latest_frame = frame_copy

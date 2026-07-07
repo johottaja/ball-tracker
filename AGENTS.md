@@ -11,8 +11,8 @@ Guidance for AI agents working in this repository.
 **Current state:** Six Python desktop apps plus shared detection libraries:
 
 - **`video_viewer/`** — record webcam video and inspect it frame by frame. Includes configurable **ball detection** (MOG2 + morphological closing, or frame diff → threshold) with contour/circularity filtering, plus **throw detection** (YOLOv11 pose overlay via `pose_detection`).
-- **`stereo_viewer/`** — dual-camera version of the video viewer: side-by-side live preview and playback, same filter set applied independently per camera (plus **Stereo tracking** and **Frame sync**, stereo-only). Records `left.mp4` and `right.mp4` under `stereo_viewer/recordings/`; on stop, the shorter clip is re-encoded with frames duplicated evenly throughout so both files have the same frame count.
-- **`game_tracker/`** — production dual-camera app for recording a full beer pong game. No debug filters; always runs stereo throw + ball tracking, triangulates 3D trajectories from configurable camera geometry, and saves throws to `game_tracker/recordings/game.json` for a future React SPA. Records `left.mp4` / `right.mp4` under `game_tracker/recordings/` with the same frame-count equalization on stop as `stereo_viewer`.
+- **`stereo_viewer/`** — dual-camera version of the video viewer: side-by-side live preview and playback, same filter set applied independently per camera (plus **Stereo tracking** and **Frame sync**, stereo-only). Records `left.mp4` and `right.mp4` under `stereo_viewer/recordings/`; on stop, the shorter clip is re-encoded to match the longer clip's frame count, duplicating frames at capture times where that camera fell behind (per-frame `time.monotonic()` timestamps; the longer clip is left unchanged).
+- **`game_tracker/`** — production dual-camera app for recording a full beer pong game. No debug filters; always runs stereo throw + ball tracking, triangulates 3D trajectories from configurable camera geometry, and saves throws to `game_tracker/recordings/game.json` for a future React SPA. Records `left.mp4` / `right.mp4` under `game_tracker/recordings/` with the same timestamp-based frame extension on stop as `stereo_viewer`.
 - **`pose_detection/`** — reusable YOLO pose pipeline: per-frame dominant-hand selection and batch extraction of arm keypoints from frame sequences.
 - **`training_recorder/`** — lightweight GUI for recording labeled training clips. Enter a training set name; each clip is saved under `recordings/<training_set>/` at the repo root (separate from `video_viewer/recordings/`).
 - **`throw_detection/`** — throw-event labeling GUI, GRU training-data export, GRU training GUI, and streaming GRU inference. Labels per-frame throw/not-throw on clips from `recordings/<set>/`; saves NumPy `.npz` datasets under `throw_detection/training_sets/`; trained models under `throw_detection/models/`.
@@ -161,7 +161,7 @@ balltracker/
 | `types.py` | `Joint`, `DominantHand`, `DominantHandSequence` |
 | `config.py` | `POSE_MODEL_PATH`, `POSE_DEVICE`, `POSE_CONF_THRESHOLD`, `POSE_KEYPOINT_MIN_CONF` |
 | **stereo_viewer** | |
-| `stereo_viewer/app.py` | `StereoViewerApp` — two camera streams, side-by-side preview/playback, independent `FrameFilter` per camera (or coordinated **Stereo tracking**); equalizes frame counts on record stop |
+| `stereo_viewer/app.py` | `StereoViewerApp` — two camera streams, side-by-side preview/playback, independent `FrameFilter` per camera (or coordinated **Stereo tracking**); extends the shorter recording on stop using capture timestamps |
 | `stereo_viewer/config.py` | `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `STEREO_DISPLAY_MAX_SIZE` |
 | `stereo_viewer/display.py` | `panel_size_for_frame`, `stereo_frame_to_photo` (horizontal composite) |
 | `stereo_viewer/stereo_tracking.py` | `StereoTrackingProcessor` — main GRU + ball track on both cameras; secondary ball-only track |
@@ -184,7 +184,7 @@ balltracker/
 | `ball_motion.py` | `BallDetectionMethod`, `MotionMaskBuilder` — MOG2, frame diff, hybrid, and hybrid-stacked masks |
 | `ball_detection.py` | Circular contour filtering, largest-ball selection, `contour_bottom_center`, drawing |
 | `pose_overlay.py` | Throw / normalized-throw / GRU-inference filter overlays (imports `pose_detection`, `throw_detection.inference`) |
-| `recording.py` | Create MP4 writer; `extend_video_evenly` re-encodes a clip with evenly distributed duplicate frames |
+| `recording.py` | Create MP4 writer; `extend_video_to_reference` re-encodes the lagging clip with duplicates where it fell behind; `extend_video_evenly` is the no-timestamp fallback |
 | `display.py` | Fit frames to max display size, convert to `PhotoImage` |
 | **throw_detection** | |
 | `config.py` | `BUFFER_SIZE` (GRU rolling window), `TRAINING_SETS_DIR`, `MODELS_DIR` |
@@ -234,7 +234,7 @@ Filters are display-only; recordings save raw camera frames.
 
 ## Pose / throw detection
 
-`pose_detection/` loads `yolo11n-pose.pt` on first use. For each frame it detects people, evaluates left/right arm chains (COCO keypoints 5–10), and picks the wrist closest to the frame center as the “dominant hand.”
+`pose_detection/` loads `yolo11n-pose.pt` on first use. Frames are downscaled so the longest side is at most `POSE_INFERENCE_MAX_SIZE` (default 640) before inference; detected keypoints are mapped back to full-resolution coordinates. For each frame it detects people, evaluates left/right arm chains (COCO keypoints 5–10), and picks the wrist closest to the frame center as the “dominant hand.”
 
 `extract_dominant_hands(frames)` runs that selection over a frame list and returns a `DominantHandSequence`: `keypoints` shaped `(num_frames, 3, 3)` (shoulder/elbow/wrist × x, y, confidence) and `sides` (`-1` missing, `0` left, `1` right).
 
@@ -296,7 +296,7 @@ Production app for recording a beer pong session and exporting 3D throw trajecto
 
 **UI:** Same record/playback/camera-selection shell as `stereo_viewer`, but **no display filters**. Ball detection method combobox only (MOG2 + closing, frame diff, hybrid, or hybrid stacked). **Camera setup…** button opens a popup for geometry fields (distances, heights, inter-camera angle, horizontal FOV). Settings persist in `game_tracker/camera_setup.json` (auto-loaded on startup, saved on dialog Save and app close).
 
-**Recording:** Raw frames to `game_tracker/recordings/left.mp4` and `right.mp4`. On stop, `extend_video_evenly` matches the shorter clip to the longer (same procedure as `stereo_viewer`). Fresh `game.json` session header written on stop.
+**Recording:** Raw frames to `game_tracker/recordings/left.mp4` and `right.mp4`. On stop, the shorter clip is extended to match the longer using capture timestamps (`extend_video_to_reference`; same procedure as `stereo_viewer`). Fresh `game.json` session header written on stop.
 
 **Tracking (`GameTrackingProcessor`):** Active during playback (live record shows raw frames). Main (left) camera: GRU throw inference + wrist-anchored ball tracking. Secondary (right): ball tracking driven by main throw label. Stereo phase gate (`AWAITING_PARTNER`) pairs valid completions across cameras; failed tracks adopt the partner phase via `trajectory_tracking.stereo.reconcile_stereo_trackers`. Shared stereo ball detection (`video_viewer.stereo_ball_detection`) feeds both trajectory tracking and an embedded `FrameSyncEngine`. Frame-indexed 2D detections captured during `TRACKING_BALL`; when both cameras complete a throw, `triangulate_throw` pairs left/right points using the measured framesync offset (linear interpolation on the secondary track).
 
@@ -345,7 +345,7 @@ Tune via `framesync/config.py`: `DROP_STREAK_FRAMES`, `MAX_HORIZONTAL_DELTA_PX`,
 
 **`pose_detection/config.py`**
 
-- **Model:** `POSE_MODEL_PATH`, `POSE_DEVICE` (default `"mps"`), `POSE_CONF_THRESHOLD`, `POSE_KEYPOINT_MIN_CONF`
+- **Model:** `POSE_MODEL_PATH`, `POSE_DEVICE` (default `"mps"`), `POSE_CONF_THRESHOLD`, `POSE_KEYPOINT_MIN_CONF`, `POSE_INFERENCE_MAX_SIZE` (default `640` — longest side sent to YOLO; keypoints scaled back to full frame)
 
 **`training_recorder/config.py`**
 

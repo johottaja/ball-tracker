@@ -29,7 +29,7 @@ from video_viewer.playback import (
     uses_mog2_streaming,
 )
 from video_viewer.playback_cache import PlaybackCache
-from video_viewer.recording import create_writer, extend_video_evenly
+from video_viewer.recording import create_writer, extend_video_evenly, extend_video_to_reference
 
 from .config import LEFT_VIDEO, RECORDINGS_DIR, RIGHT_VIDEO, STEREO_DISPLAY_MAX_SIZE, TARGET_FPS
 from .display import panel_size_for_frame, stereo_frame_to_photo
@@ -50,6 +50,7 @@ class CameraStream:
     mog2_stream_frame_index: int | None = None
     last_raw_frame: np.ndarray | None = None
     recorded_frame_count: int = 0
+    recorded_timestamps: list[float] = field(default_factory=list)
     preview_frame_id: int = 0
     video_path: Path | None = None
 
@@ -441,34 +442,57 @@ class StereoViewerApp:
         return True
 
     def _make_frame_consumer(self, stream: CameraStream):
-        def on_frame(frame: np.ndarray) -> None:
+        def on_frame(frame: np.ndarray, captured_at: float) -> None:
             if stream.writer is not None:
                 stream.writer.write(frame)
                 stream.recorded_frame_count += 1
+                stream.recorded_timestamps.append(captured_at)
 
         return on_frame
 
     def _equalize_stereo_recordings(self) -> tuple[int, list[str]]:
-        """Extend the shorter clip by evenly duplicating frames until both match."""
-        target_count = max(
-            self.left.recorded_frame_count,
-            self.right.recorded_frame_count,
-        )
+        """Extend the shorter clip by duplicating frames where it fell behind."""
+        left_count = self.left.recorded_frame_count
+        right_count = self.right.recorded_frame_count
+        target_count = max(left_count, right_count)
         extended_labels: list[str] = []
-        for stream, label in (
-            (self.left, "left"),
-            (self.right, "right"),
-        ):
-            source_count = stream.recorded_frame_count
-            if source_count <= 0 or source_count >= target_count:
-                continue
-            extend_video_evenly(
-                stream.default_video,
-                source_count=source_count,
-                target_count=target_count,
-                fps=self.record_fps,
-            )
-            extended_labels.append(f"{label} +{target_count - source_count}")
+
+        if left_count < target_count:
+            if self.left.recorded_timestamps and self.right.recorded_timestamps:
+                extend_video_to_reference(
+                    self.left.default_video,
+                    source_timestamps=self.left.recorded_timestamps,
+                    reference_timestamps=self.right.recorded_timestamps,
+                    source_count=left_count,
+                    fps=self.record_fps,
+                )
+            else:
+                extend_video_evenly(
+                    self.left.default_video,
+                    source_count=left_count,
+                    target_count=target_count,
+                    fps=self.record_fps,
+                )
+            extended_labels.append(f"left +{target_count - left_count}")
+
+        if right_count < target_count:
+            if self.left.recorded_timestamps and self.right.recorded_timestamps:
+                extend_video_to_reference(
+                    self.right.default_video,
+                    source_timestamps=self.right.recorded_timestamps,
+                    reference_timestamps=self.left.recorded_timestamps,
+                    source_count=right_count,
+                    fps=self.record_fps,
+                )
+            else:
+                extend_video_evenly(
+                    self.right.default_video,
+                    source_count=right_count,
+                    target_count=target_count,
+                    fps=self.record_fps,
+                )
+            extended_labels.append(f"right +{target_count - right_count}")
+
         return target_count, extended_labels
 
     def _enter_record_mode(self) -> None:
@@ -612,6 +636,7 @@ class StereoViewerApp:
 
             for stream in self._streams():
                 stream.recorded_frame_count = 0
+                stream.recorded_timestamps = []
 
             self.recording = True
             if self.left.camera_reader is not None:
@@ -642,6 +667,7 @@ class StereoViewerApp:
             for stream in self._streams():
                 stream.video_path = stream.default_video
                 stream.recorded_frame_count = 0
+                stream.recorded_timestamps = []
             self.record_btn.configure(text="Start recording")
             self._set_camera_controls_enabled(True)
             saved = f"Saved {LEFT_VIDEO.name} and {RIGHT_VIDEO.name}"

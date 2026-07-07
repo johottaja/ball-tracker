@@ -206,7 +206,7 @@ class TrainingRecorderApp:
         self._schedule_preview()
         return True
 
-    def _on_captured_frame(self, frame: np.ndarray) -> None:
+    def _on_captured_frame(self, frame: np.ndarray, _captured_at: float) -> None:
         if self.writer is not None:
             self.writer.write(frame)
 
