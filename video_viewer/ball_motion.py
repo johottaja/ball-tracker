@@ -46,10 +46,8 @@ def uses_frame_diff_component(method: BallDetectionMethod) -> bool:
     return method in (BallDetectionMethod.FRAME_DIFF, *HYBRID_METHODS)
 
 
-def _frame_diff_mask(current: np.ndarray, reference: np.ndarray | None) -> np.ndarray | None:
-    if reference is None or reference.shape != current.shape:
-        return None
-    diff = cv2.subtract(current, reference)
+def _single_diff_thresh(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    diff = cv2.absdiff(a, b)
     amplified = cv2.convertScaleAbs(diff, alpha=DIFF_BRIGHTNESS_FACTOR, beta=0)
     if amplified.ndim == 3:
         gray = cv2.cvtColor(amplified, cv2.COLOR_BGR2GRAY)
@@ -61,6 +59,36 @@ def _frame_diff_mask(current: np.ndarray, reference: np.ndarray | None) -> np.nd
         np.uint8,
     )
     return cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+
+
+def _frame_diff_mask(
+    current: np.ndarray,
+    reference: np.ndarray | None,
+    next_frame: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """
+    Motion mask from frame differencing.
+
+    Two-frame diff (``current`` vs ``reference``) is symmetric, so it lights up
+    both where the object newly appeared *and* where it used to be — a fast-moving
+    ball shows up as two separate blobs ("ghosting"). When ``next_frame`` is
+    available (playback, where frames are seekable), three-frame differencing
+    ANDs the backward diff with the forward diff (``next_frame`` vs ``current``):
+    the object's current position is present in both diffs, while the previous-
+    and next-position ghosts each only appear in one, so the AND cancels them.
+    """
+    if reference is None or reference.shape != current.shape:
+        return None
+    thresh_prev = _single_diff_thresh(current, reference)
+    if next_frame is None or next_frame.shape != current.shape:
+        return thresh_prev
+    thresh_next = _single_diff_thresh(next_frame, current)
+    combined = cv2.bitwise_and(thresh_prev, thresh_next)
+    kernel = np.ones(
+        (FRAME_DIFF_MORPH_KERNEL_SIZE, FRAME_DIFF_MORPH_KERNEL_SIZE),
+        np.uint8,
+    )
+    return cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
 
 
 def combine_hybrid_masks(
@@ -125,6 +153,7 @@ class MotionMaskBuilder:
         current: np.ndarray,
         reference: np.ndarray | None = None,
         *,
+        next_frame: np.ndarray | None = None,
         mog2_warmup_frames: list[np.ndarray] | None = None,
         cache: object | None = None,
         frame_index: int | None = None,
@@ -162,7 +191,7 @@ class MotionMaskBuilder:
             )
         else:
             prev = reference if reference is not None else self._prev_frame
-            frame_diff_mask = _frame_diff_mask(current, prev)
+            frame_diff_mask = _frame_diff_mask(current, prev, next_frame)
             if frame_diff_mask is not None and cache is not None and frame_index is not None:
                 cache.put_motion_mask(
                     BallDetectionMethod.FRAME_DIFF, frame_index, frame_diff_mask
@@ -176,6 +205,7 @@ class MotionMaskBuilder:
         current: np.ndarray,
         reference: np.ndarray | None = None,
         *,
+        next_frame: np.ndarray | None = None,
         mog2_warmup_frames: list[np.ndarray] | None = None,
         cache: object | None = None,
         frame_index: int | None = None,
@@ -190,6 +220,7 @@ class MotionMaskBuilder:
             mog2_mask, frame_diff_mask = self.build_component_masks(
                 current,
                 reference,
+                next_frame=next_frame,
                 mog2_warmup_frames=mog2_warmup_frames,
                 cache=cache,
                 frame_index=frame_index,
@@ -199,6 +230,7 @@ class MotionMaskBuilder:
         mask = self.build_mask(
             current,
             reference,
+            next_frame=next_frame,
             mog2_warmup_frames=mog2_warmup_frames,
             cache=cache,
             frame_index=frame_index,
@@ -210,6 +242,7 @@ class MotionMaskBuilder:
         current: np.ndarray,
         reference: np.ndarray | None = None,
         *,
+        next_frame: np.ndarray | None = None,
         mog2_warmup_frames: list[np.ndarray] | None = None,
         cache: object | None = None,
         frame_index: int | None = None,
@@ -229,12 +262,13 @@ class MotionMaskBuilder:
 
         if self._method == BallDetectionMethod.FRAME_DIFF:
             prev = reference if reference is not None else self._prev_frame
-            mask = _frame_diff_mask(current, prev)
+            mask = _frame_diff_mask(current, prev, next_frame)
             self._prev_frame = current.copy()
         elif self._method == BallDetectionMethod.HYBRID_STACKED:
             mog2_mask, frame_diff_mask = self.build_component_masks(
                 current,
                 reference,
+                next_frame=next_frame,
                 cache=cache,
                 frame_index=frame_index,
             )
@@ -246,6 +280,7 @@ class MotionMaskBuilder:
             self.build_component_masks(
                 current,
                 reference,
+                next_frame=next_frame,
                 cache=cache,
                 frame_index=frame_index,
             )

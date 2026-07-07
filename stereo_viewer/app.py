@@ -684,6 +684,7 @@ class StereoViewerApp:
         frame: np.ndarray,
         *,
         previous_frame: np.ndarray | None = None,
+        next_frame: np.ndarray | None = None,
         mog2_warmup_frames: list[np.ndarray] | None = None,
         warmup_frames: list[np.ndarray] | None = None,
         warmup_start_index: int | None = None,
@@ -699,6 +700,7 @@ class StereoViewerApp:
         return stream.frame_filter.apply(
             frame,
             previous_frame=previous_frame,
+            next_frame=next_frame,
             mog2_warmup_frames=mog2_warmup_frames,
             warmup_frames=warmup_frames,
             warmup_start_index=warmup_start_index,
@@ -715,6 +717,8 @@ class StereoViewerApp:
         frame_index: int = 0,
         left_previous: np.ndarray | None = None,
         right_previous: np.ndarray | None = None,
+        left_next: np.ndarray | None = None,
+        right_next: np.ndarray | None = None,
         left_mog2_warmup: list[np.ndarray] | None = None,
         right_mog2_warmup: list[np.ndarray] | None = None,
         left_warmup: list[np.ndarray] | None = None,
@@ -734,8 +738,10 @@ class StereoViewerApp:
                 main_warmup_frames=left_warmup,
                 main_warmup_start_index=left_warmup_start_index,
                 main_previous_frame=left_previous,
+                main_next_frame=left_next,
                 main_mog2_warmup_frames=left_mog2_warmup,
                 secondary_previous_frame=right_previous,
+                secondary_next_frame=right_next,
                 secondary_mog2_warmup_frames=right_mog2_warmup,
                 video_fps=video_fps,
                 cache=cache,
@@ -747,8 +753,10 @@ class StereoViewerApp:
                 right_frame,
                 frame_index=frame_index,
                 main_previous_frame=left_previous,
+                main_next_frame=left_next,
                 main_mog2_warmup_frames=left_mog2_warmup,
                 secondary_previous_frame=right_previous,
+                secondary_next_frame=right_next,
                 secondary_mog2_warmup_frames=right_mog2_warmup,
                 video_fps=video_fps,
                 cache=cache,
@@ -759,6 +767,7 @@ class StereoViewerApp:
                 self.left,
                 left_frame,
                 previous_frame=left_previous,
+                next_frame=left_next,
                 mog2_warmup_frames=left_mog2_warmup,
                 warmup_frames=left_warmup,
                 warmup_start_index=left_warmup_start_index,
@@ -770,6 +779,7 @@ class StereoViewerApp:
                 self.right,
                 right_frame,
                 previous_frame=right_previous,
+                next_frame=right_next,
                 mog2_warmup_frames=right_mog2_warmup,
                 warmup_frames=right_warmup,
                 warmup_start_index=right_warmup_start_index,
@@ -813,6 +823,8 @@ class StereoViewerApp:
             (
                 left_previous,
                 right_previous,
+                left_next,
+                right_next,
                 left_mog2_warmup,
                 right_mog2_warmup,
             ) = stereo_ball_mask_playback_inputs(
@@ -824,12 +836,15 @@ class StereoViewerApp:
                 self.right.mog2_stream_frame_index,
                 self.playback_cache.main,
                 self.playback_cache.secondary,
+                self.frame_count,
             )
             right_warmup = None
         elif self._is_frame_sync():
             (
                 left_previous,
                 right_previous,
+                left_next,
+                right_next,
                 left_mog2_warmup,
                 right_mog2_warmup,
             ) = stereo_ball_mask_playback_inputs(
@@ -841,12 +856,14 @@ class StereoViewerApp:
                 self.right.mog2_stream_frame_index,
                 self.playback_cache.main,
                 self.playback_cache.secondary,
+                self.frame_count,
             )
             left_warmup = None
             right_warmup = None
         else:
             (
                 left_previous,
+                left_next,
                 left_mog2_warmup,
                 left_warmup,
                 left_warmup_start_index,
@@ -857,9 +874,11 @@ class StereoViewerApp:
                 self.left.gru_stream_frame_index,
                 self.left.mog2_stream_frame_index,
                 cache=self.playback_cache.main,
+                frame_count=self.frame_count,
             )
             (
                 right_previous,
+                right_next,
                 right_mog2_warmup,
                 right_warmup,
                 right_warmup_start_index,
@@ -870,6 +889,7 @@ class StereoViewerApp:
                 self.right.gru_stream_frame_index,
                 self.right.mog2_stream_frame_index,
                 cache=self.playback_cache.secondary,
+                frame_count=self.frame_count,
             )
 
         self._display_stereo_frames(
@@ -878,6 +898,8 @@ class StereoViewerApp:
             frame_index=self.frame_index,
             left_previous=left_previous,
             right_previous=right_previous,
+            left_next=left_next,
+            right_next=right_next,
             left_mog2_warmup=left_mog2_warmup,
             right_mog2_warmup=right_mog2_warmup,
             left_warmup=left_warmup,

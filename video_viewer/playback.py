@@ -47,6 +47,16 @@ def previous_frame_for_diff(
     return frame if ok else None
 
 
+def next_frame_for_diff(
+    cap: cv2.VideoCapture, index: int, frame_count: int = 0
+) -> np.ndarray | None:
+    """Read frame N+1 for three-frame differencing (playback is seekable)."""
+    if frame_count > 0 and index + 1 >= frame_count:
+        return None
+    ok, frame = read_frame_at(cap, index + 1)
+    return frame if ok else None
+
+
 def mog2_warmup_frames(
     cap: cv2.VideoCapture, index: int, history: int = MOG2_HISTORY
 ) -> list[np.ndarray]:
@@ -117,12 +127,15 @@ def ball_mask_playback_inputs(
     index: int,
     mog2_stream_frame_index: int | None,
     cache: object | None = None,
-) -> tuple[np.ndarray | None, list[np.ndarray] | None]:
+    frame_count: int = 0,
+) -> tuple[np.ndarray | None, np.ndarray | None, list[np.ndarray] | None]:
     previous: np.ndarray | None = None
+    next_frame: np.ndarray | None = None
     mog2_warmup: list[np.ndarray] | None = None
 
     if uses_frame_diff_component(method) and not _frame_diff_mask_cached(cache, index):
         previous = previous_frame_for_diff(cap, index)
+        next_frame = next_frame_for_diff(cap, index, frame_count)
 
     if method == BallDetectionMethod.MOG2_CLOSING:
         if cache is None or not cache.has_motion_mask(method, index):
@@ -134,7 +147,7 @@ def ball_mask_playback_inputs(
             cap, index, mog2_stream_frame_index
         )
 
-    return previous, mog2_warmup
+    return previous, next_frame, mog2_warmup
 
 
 def stereo_ball_mask_playback_inputs(
@@ -146,22 +159,39 @@ def stereo_ball_mask_playback_inputs(
     right_mog2_stream_frame_index: int | None,
     left_cache: object | None = None,
     right_cache: object | None = None,
-) -> tuple[np.ndarray | None, np.ndarray | None, list[np.ndarray] | None, list[np.ndarray] | None]:
-    left_previous, left_mog2_warmup = ball_mask_playback_inputs(
+    frame_count: int = 0,
+) -> tuple[
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    list[np.ndarray] | None,
+    list[np.ndarray] | None,
+]:
+    left_previous, left_next, left_mog2_warmup = ball_mask_playback_inputs(
         left_cap,
         method,
         index,
         left_mog2_stream_frame_index,
         left_cache,
+        frame_count,
     )
-    right_previous, right_mog2_warmup = ball_mask_playback_inputs(
+    right_previous, right_next, right_mog2_warmup = ball_mask_playback_inputs(
         right_cap,
         method,
         index,
         right_mog2_stream_frame_index,
         right_cache,
+        frame_count,
     )
-    return left_previous, right_previous, left_mog2_warmup, right_mog2_warmup
+    return (
+        left_previous,
+        right_previous,
+        left_next,
+        right_next,
+        left_mog2_warmup,
+        right_mog2_warmup,
+    )
 
 
 def filter_inputs_for_playback(
@@ -171,19 +201,28 @@ def filter_inputs_for_playback(
     gru_stream_frame_index: int | None,
     mog2_stream_frame_index: int | None = None,
     cache: object | None = None,
-) -> tuple[np.ndarray | None, list[np.ndarray] | None, list[np.ndarray] | None, int | None]:
+    frame_count: int = 0,
+) -> tuple[
+    np.ndarray | None,
+    np.ndarray | None,
+    list[np.ndarray] | None,
+    list[np.ndarray] | None,
+    int | None,
+]:
     previous: np.ndarray | None = None
+    next_frame: np.ndarray | None = None
     mog2_warmup: list[np.ndarray] | None = None
     warmup_frames: list[np.ndarray] | None = None
     warmup_start_index: int | None = None
 
     if frame_filter.filter_id in BALL_MASK_FILTER_IDS:
-        previous, mog2_warmup = ball_mask_playback_inputs(
+        previous, next_frame, mog2_warmup = ball_mask_playback_inputs(
             cap,
             frame_filter.ball_detection_method,
             index,
             mog2_stream_frame_index,
             cache,
+            frame_count,
         )
 
     if frame_filter.filter_id in (
@@ -204,7 +243,7 @@ def filter_inputs_for_playback(
                     0, index - frame_filter.throw_buffer_size() + 1
                 )
 
-    return previous, mog2_warmup, warmup_frames, warmup_start_index
+    return previous, next_frame, mog2_warmup, warmup_frames, warmup_start_index
 
 
 def apply_filter_to_frame(
@@ -212,6 +251,7 @@ def apply_filter_to_frame(
     frame: np.ndarray,
     *,
     previous_frame: np.ndarray | None = None,
+    next_frame: np.ndarray | None = None,
     mog2_warmup_frames: list[np.ndarray] | None = None,
     warmup_frames: list[np.ndarray] | None = None,
     warmup_start_index: int | None = None,
@@ -222,6 +262,7 @@ def apply_filter_to_frame(
     return frame_filter.apply(
         frame,
         previous_frame=previous_frame,
+        next_frame=next_frame,
         mog2_warmup_frames=mog2_warmup_frames,
         warmup_frames=warmup_frames,
         warmup_start_index=warmup_start_index,
@@ -237,6 +278,7 @@ def frame_to_display_photo(
     display_size: tuple[int, int],
     *,
     previous_frame: np.ndarray | None = None,
+    next_frame: np.ndarray | None = None,
     mog2_warmup_frames: list[np.ndarray] | None = None,
     warmup_frames: list[np.ndarray] | None = None,
     warmup_start_index: int | None = None,
@@ -248,6 +290,7 @@ def frame_to_display_photo(
         frame_filter,
         frame,
         previous_frame=previous_frame,
+        next_frame=next_frame,
         mog2_warmup_frames=mog2_warmup_frames,
         warmup_frames=warmup_frames,
         warmup_start_index=warmup_start_index,

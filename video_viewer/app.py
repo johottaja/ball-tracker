@@ -415,18 +415,20 @@ class VideoViewerApp:
         if self.frame_index < 0:
             self.frame_index = index
 
-        previous, mog2_warmup, warmup_frames, warmup_start_index = filter_inputs_for_playback(
+        previous, next_frame, mog2_warmup, warmup_frames, warmup_start_index = filter_inputs_for_playback(
             self.cap,
             self.frame_filter,
             self.frame_index,
             self._gru_stream_frame_index,
             self._mog2_stream_frame_index,
             cache=self.playback_cache.main,
+            frame_count=self.frame_count,
         )
 
         self._display_frame(
             frame,
             previous_frame=previous,
+            next_frame=next_frame,
             mog2_warmup_frames=mog2_warmup,
             warmup_frames=warmup_frames,
             warmup_start_index=warmup_start_index,
@@ -443,6 +445,7 @@ class VideoViewerApp:
         frame: np.ndarray,
         *,
         previous_frame: np.ndarray | None = None,
+        next_frame: np.ndarray | None = None,
         mog2_warmup_frames: list[np.ndarray] | None = None,
         warmup_frames: list[np.ndarray] | None = None,
         warmup_start_index: int | None = None,
@@ -455,6 +458,7 @@ class VideoViewerApp:
             frame,
             self.display_size,
             previous_frame=previous_frame,
+            next_frame=next_frame,
             mog2_warmup_frames=mog2_warmup_frames,
             warmup_frames=warmup_frames,
             warmup_start_index=warmup_start_index,
