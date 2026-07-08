@@ -130,6 +130,7 @@ class CameraReader:
     def __init__(self, cap: cv2.VideoCapture) -> None:
         self._cap = cap
         self._lock = threading.Lock()
+        self._consumer_lock = threading.Lock()
         self._latest_frame: np.ndarray | None = None
         self._frame_id = 0
         self._consumer: FrameConsumer | None = None
@@ -149,18 +150,20 @@ class CameraReader:
 
     def stop(self) -> None:
         self._running = False
-        with self._lock:
-            self._consumer = None
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
+        with self._consumer_lock:
+            with self._lock:
+                self._consumer = None
         with self._lock:
             self._latest_frame = None
             self._frame_id = 0
 
     def set_frame_consumer(self, consumer: FrameConsumer | None) -> None:
-        with self._lock:
-            self._consumer = consumer
+        with self._consumer_lock:
+            with self._lock:
+                self._consumer = consumer
 
     def get_latest_frame(self) -> tuple[bool, np.ndarray | None, int]:
         with self._lock:
@@ -177,11 +180,11 @@ class CameraReader:
 
             frame_copy = frame.copy()
             captured_at = time.monotonic()
-            with self._lock:
-                consumer = self._consumer
-
-            if consumer is not None:
-                consumer(frame_copy, captured_at)
+            with self._consumer_lock:
+                with self._lock:
+                    consumer = self._consumer
+                if consumer is not None:
+                    consumer(frame_copy, captured_at)
 
             with self._lock:
                 self._latest_frame = frame_copy

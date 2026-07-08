@@ -6,157 +6,106 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
+from calibration import TableCalibration
+
 from .config import MAX_TRIANGULATION_HEIGHT_M, MAX_TRIANGULATION_RESIDUAL_M
 from .game_data import CurvePoint3D, Point2D, Point3D, ThrowRecord
-from .setup_config import CameraSetup
-
-TABLE_CENTER = np.array([0.0, 0.0, 0.0], dtype=np.float64)
-WORLD_UP = np.array([0.0, 0.0, 1.0], dtype=np.float64)
 
 
 @dataclass(frozen=True)
-class StereoCameraModel:
-    """Cached intrinsics and projection matrices for both cameras."""
+class StereoProjectionModel:
+    """Cached 3×4 projection matrices for both calibrated cameras."""
 
     width: int
     height: int
-    k: np.ndarray
-    p_main: np.ndarray
-    p_secondary: np.ndarray
-    main_position: np.ndarray
-    secondary_position: np.ndarray
+    p_left: np.ndarray
+    p_right: np.ndarray
 
 
-def _intrinsic_matrix(width: int, height: int, horizontal_fov_deg: float) -> np.ndarray:
-    fov_rad = math.radians(horizontal_fov_deg)
-    fx = (width / 2.0) / math.tan(fov_rad / 2.0)
-    fy = fx
-    cx = width / 2.0
-    cy = height / 2.0
-    return np.array(
-        [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]],
-        dtype=np.float64,
-    )
-
-
-def _look_at_rt(
-    position: np.ndarray,
-    target: np.ndarray,
-    up: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    """World-to-camera R and t for OpenCV (camera looks along +Z)."""
-    forward = target - position
-    forward_norm = np.linalg.norm(forward)
-    if forward_norm < 1e-9:
-        forward = np.array([0.0, 0.0, -1.0], dtype=np.float64)
-    else:
-        forward = forward / forward_norm
-
-    right = np.cross(up, forward)
-    right_norm = np.linalg.norm(right)
-    if right_norm < 1e-9:
-        right = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    else:
-        right = right / right_norm
-
-    down = np.cross(forward, right)
-    r = np.vstack([right, down, forward])
-    t = -r @ position
-    return r, t
-
-
-def camera_positions(setup: CameraSetup) -> tuple[np.ndarray, np.ndarray]:
-    """Primary at middle of -Y end; secondary at azimuth -90° + angle."""
-    main = np.array(
-        [0.0, -setup.main_distance_m, setup.main_height_m],
-        dtype=np.float64,
-    )
-    azimuth_rad = math.radians(-90.0 + setup.camera_angle_deg)
-    secondary = np.array(
-        [
-            setup.secondary_distance_m * math.cos(azimuth_rad),
-            setup.secondary_distance_m * math.sin(azimuth_rad),
-            setup.secondary_height_m,
-        ],
-        dtype=np.float64,
-    )
-    return main, secondary
-
-
-def build_stereo_camera_model(
-    setup: CameraSetup,
+def build_stereo_projection_model(
+    calibration: TableCalibration,
     *,
     width: int,
     height: int,
-) -> StereoCameraModel:
-    k = _intrinsic_matrix(width, height, setup.horizontal_fov_deg)
-    main_pos, secondary_pos = camera_positions(setup)
-
-    r_main, t_main = _look_at_rt(main_pos, TABLE_CENTER, WORLD_UP)
-    r_secondary, t_secondary = _look_at_rt(secondary_pos, TABLE_CENTER, WORLD_UP)
-
-    rt_main = np.hstack([r_main, t_main.reshape(3, 1)])
-    rt_secondary = np.hstack([r_secondary, t_secondary.reshape(3, 1)])
-
-    return StereoCameraModel(
+) -> StereoProjectionModel:
+    if calibration.image_width != width or calibration.image_height != height:
+        raise ValueError(
+            "Video frame size does not match calibration "
+            f"({calibration.image_width}×{calibration.image_height} vs {width}×{height})"
+        )
+    left = calibration.camera("left")
+    right = calibration.camera("right")
+    if left is None or right is None:
+        raise ValueError("Calibration must include left and right cameras")
+    return StereoProjectionModel(
         width=width,
         height=height,
-        k=k,
-        p_main=k @ rt_main,
-        p_secondary=k @ rt_secondary,
-        main_position=main_pos,
-        secondary_position=secondary_pos,
+        p_left=left.projection_matrix,
+        p_right=right.projection_matrix,
     )
 
 
 def _triangulate_point(
-    p_main: np.ndarray,
-    p_secondary: np.ndarray,
-    model: StereoCameraModel,
+    p_left: np.ndarray,
+    p_right: np.ndarray,
+    model: StereoProjectionModel,
 ) -> tuple[np.ndarray | None, float]:
-    pts_main = np.array([[p_main[0]], [p_main[1]]], dtype=np.float64)
-    pts_secondary = np.array([[p_secondary[0]], [p_secondary[1]]], dtype=np.float64)
-    points_4d = cv2.triangulatePoints(model.p_main, model.p_secondary, pts_main, pts_secondary)
+    pts_left = np.array([[p_left[0]], [p_left[1]]], dtype=np.float64)
+    pts_right = np.array([[p_right[0]], [p_right[1]]], dtype=np.float64)
+    points_4d = cv2.triangulatePoints(model.p_left, model.p_right, pts_left, pts_right)
     w = points_4d[3, 0]
     if abs(w) < 1e-9:
         return None, float("inf")
     point = points_4d[:3, 0] / w
 
-    ray_main = model.main_position
-    dir_main = point - ray_main
-    dir_main_norm = np.linalg.norm(dir_main)
-    if dir_main_norm < 1e-9:
+    # Epipolar residual via closest approach between the two viewing rays.
+    c_left = _camera_center(model.p_left)
+    c_right = _camera_center(model.p_right)
+    if c_left is None or c_right is None:
         return None, float("inf")
-    dir_main = dir_main / dir_main_norm
 
-    ray_secondary = model.secondary_position
-    dir_secondary = point - ray_secondary
-    dir_secondary_norm = np.linalg.norm(dir_secondary)
-    if dir_secondary_norm < 1e-9:
+    dir_left = point - c_left
+    dir_right = point - c_right
+    dir_left_norm = np.linalg.norm(dir_left)
+    dir_right_norm = np.linalg.norm(dir_right)
+    if dir_left_norm < 1e-9 or dir_right_norm < 1e-9:
         return None, float("inf")
-    dir_secondary = dir_secondary / dir_secondary_norm
+    dir_left = dir_left / dir_left_norm
+    dir_right = dir_right / dir_right_norm
 
-    w0 = ray_main - ray_secondary
-    a = np.dot(dir_main, dir_main)
-    b = np.dot(dir_main, dir_secondary)
-    c = np.dot(dir_secondary, dir_secondary)
-    d = np.dot(dir_main, w0)
-    e = np.dot(dir_secondary, w0)
+    w0 = c_left - c_right
+    a = np.dot(dir_left, dir_left)
+    b = np.dot(dir_left, dir_right)
+    c = np.dot(dir_right, dir_right)
+    d = np.dot(dir_left, w0)
+    e = np.dot(dir_right, w0)
     denom = a * c - b * b
     if abs(denom) < 1e-9:
-        residual = float(np.linalg.norm(point - ray_main))
+        residual = float(np.linalg.norm(point - c_left))
     else:
         sc = (b * e - c * d) / denom
         tc = (a * e - b * d) / denom
-        closest_main = ray_main + sc * dir_main
-        closest_secondary = ray_secondary + tc * dir_secondary
-        residual = float(np.linalg.norm(closest_main - closest_secondary) / 2.0)
+        closest_left = c_left + sc * dir_left
+        closest_right = c_right + tc * dir_right
+        residual = float(np.linalg.norm(closest_left - closest_right) / 2.0)
 
     if point[2] < 0.0 or point[2] > MAX_TRIANGULATION_HEIGHT_M:
         return None, residual
     if residual > MAX_TRIANGULATION_RESIDUAL_M:
         return None, residual
     return point, residual
+
+
+def _camera_center(projection: np.ndarray) -> np.ndarray | None:
+    """Camera center in world coordinates from a 3×4 projection matrix."""
+    if projection.shape != (3, 4):
+        return None
+    r = projection[:, :3]
+    t = projection[:, 3]
+    det = np.linalg.det(r)
+    if abs(det) < 1e-9:
+        return None
+    return -np.linalg.inv(r) @ t
 
 
 def _polyline_length_3d(points: list[tuple[float, float, float]]) -> float:
@@ -175,7 +124,7 @@ def interpolate_track_at_frame(
     track: list[Point2D],
     frame: float,
 ) -> tuple[float, float] | None:
-    """Linear interpolation of a 2D track at a (possibly fractional) frame index."""
+    """Linear interpolation of a 2D track at a fractional frame index."""
     if not track:
         return None
 
@@ -237,17 +186,20 @@ def triangulate_throw(
     left_track: list[Point2D],
     right_track: list[Point2D],
     *,
-    setup: CameraSetup,
+    calibration: TableCalibration | None,
     frame_size: tuple[int, int],
     fps: float,
     throw_id: int,
     frame_offset: float | None = None,
 ) -> ThrowRecord | None:
-    if not left_track or not right_track:
+    if calibration is None or not left_track or not right_track:
         return None
 
     width, height = frame_size
-    model = build_stereo_camera_model(setup, width=width, height=height)
+    try:
+        model = build_stereo_projection_model(calibration, width=width, height=height)
+    except ValueError:
+        return None
 
     right_by_frame = {p.frame: p for p in right_track}
     points_3d: list[Point3D] = []

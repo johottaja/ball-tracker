@@ -96,6 +96,8 @@ class TrainingRecorderApp:
 
     def _release_capture(self) -> None:
         self._cancel_after()
+        if self.camera_reader is not None:
+            self.camera_reader.set_frame_consumer(None)
         if self.writer is not None:
             self.writer.release()
             self.writer = None

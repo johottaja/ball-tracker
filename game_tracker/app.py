@@ -29,6 +29,8 @@ from video_viewer.playback import (
 from video_viewer.playback_cache import PlaybackCache
 from video_viewer.recording import create_writer, extend_video_evenly, extend_video_to_reference
 
+from calibration import TableCalibration, TableCalibrationDialog, capture_stereo_pair, load_calibration
+
 from .config import (
     DISPLAY_MAX_SIZE,
     GAME_JSON,
@@ -78,8 +80,10 @@ class GameTrackerApp:
         self.right = CameraStream("Right", RIGHT_VIDEO)
 
         self.camera_setup = load_setup_config()
+        self.calibration = load_calibration()
         self.processor = GameTrackingProcessor()
         self.processor.set_camera_setup(self.camera_setup)
+        self.processor.set_calibration(self.calibration)
         self.processor.set_on_throw_recorded(self._on_throw_recorded)
         self.playback_cache = PlaybackCache()
 
@@ -124,6 +128,9 @@ class GameTrackerApp:
             command=self._on_mode_change,
         ).pack(side=tk.LEFT, padx=(4, 12))
 
+        ttk.Button(toolbar, text="Calibrate", command=self._open_calibration).pack(
+            side=tk.RIGHT, padx=(4, 0)
+        )
         ttk.Button(toolbar, text="Camera setup…", command=self._open_setup_dialog).pack(
             side=tk.RIGHT, padx=(4, 0)
         )
@@ -238,6 +245,35 @@ class GameTrackerApp:
         )
         self._setup_dialog.show()
 
+    def _open_calibration(self) -> None:
+        frames = capture_stereo_pair(
+            mode=self.mode.get(),
+            frame_index=self.frame_index,
+            left_last_raw=self.left.last_raw_frame,
+            right_last_raw=self.right.last_raw_frame,
+            left_cap=self.left.cap,
+            right_cap=self.right.cap,
+        )
+        if frames is None:
+            messagebox.showwarning(
+                "No frames",
+                "Open cameras or a stereo video pair and show a frame before calibrating.",
+                parent=self.root,
+            )
+            return
+        left_frame, right_frame = frames
+        TableCalibrationDialog(
+            self.root,
+            left_frame,
+            right_frame,
+            DISPLAY_MAX_SIZE,
+            on_save=self._on_calibration_saved,
+        ).show()
+
+    def _on_calibration_saved(self, calibration: TableCalibration) -> None:
+        self.calibration = calibration
+        self.processor.set_calibration(calibration)
+
     def _on_camera_setup_saved(self, setup: CameraSetup) -> None:
         self.camera_setup = setup
         self.processor.set_camera_setup(setup)
@@ -289,6 +325,8 @@ class GameTrackerApp:
     def _release_stream(self, stream: CameraStream) -> None:
         stream.gru_stream_frame_index = None
         stream.mog2_stream_frame_index = None
+        if stream.camera_reader is not None:
+            stream.camera_reader.set_frame_consumer(None)
         if stream.writer is not None:
             stream.writer.release()
             stream.writer = None

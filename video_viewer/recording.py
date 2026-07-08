@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import shutil
+import subprocess
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 from .config import DEFAULT_VIDEO
 
@@ -64,6 +67,74 @@ def indices_for_lagging_stream(
     return indices
 
 
+def _has_consecutive_duplicates(indices: list[int]) -> bool:
+    return any(
+        indices[index] == indices[index - 1] for index in range(1, len(indices))
+    )
+
+
+def _write_mp4_with_ffmpeg(
+    path: Path,
+    *,
+    frames: list[np.ndarray],
+    indices: list[int],
+    fps: float,
+    width: int,
+    height: int,
+) -> bool:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return False
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgr24",
+        "-s",
+        f"{width}x{height}",
+        "-r",
+        str(fps),
+        "-i",
+        "pipe:0",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(path),
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    if proc.stdin is None:
+        return False
+
+    try:
+        for source_index in indices:
+            frame = frames[source_index]
+            if not frame.flags["C_CONTIGUOUS"]:
+                frame = np.ascontiguousarray(frame)
+            proc.stdin.write(frame.tobytes())
+    except (BrokenPipeError, OSError, ValueError):
+        proc.stdin.close()
+        proc.wait()
+        return False
+
+    proc.stdin.close()
+    if proc.wait() != 0:
+        return False
+    return path.is_file() and path.stat().st_size > 0
+
+
 def _reencode_video_with_indices(
     path: Path,
     *,
@@ -90,6 +161,18 @@ def _reencode_video_with_indices(
         return False
 
     temp_path = path.with_name(f"{path.stem}.tmp{path.suffix}")
+    if _has_consecutive_duplicates(indices) and _write_mp4_with_ffmpeg(
+        temp_path,
+        frames=frames,
+        indices=indices,
+        fps=fps,
+        width=width,
+        height=height,
+    ):
+        path.unlink(missing_ok=True)
+        temp_path.rename(path)
+        return True
+
     writer = create_writer(fps, width, height, temp_path)
     for source_index in indices:
         writer.write(frames[source_index])

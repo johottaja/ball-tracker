@@ -31,6 +31,8 @@ from video_viewer.playback import (
 from video_viewer.playback_cache import PlaybackCache
 from video_viewer.recording import create_writer, extend_video_evenly, extend_video_to_reference
 
+from calibration import TableCalibrationDialog, capture_stereo_pair
+
 from .config import LEFT_VIDEO, RECORDINGS_DIR, RIGHT_VIDEO, STEREO_DISPLAY_MAX_SIZE, TARGET_FPS
 from .display import panel_size_for_frame, stereo_frame_to_photo
 from .frame_sync import FrameSyncProcessor
@@ -112,6 +114,9 @@ class StereoViewerApp:
             command=self._on_mode_change,
         ).pack(side=tk.LEFT, padx=(4, 12))
 
+        ttk.Button(toolbar, text="Calibrate", command=self._open_calibration).pack(
+            side=tk.RIGHT, padx=(4, 0)
+        )
         ttk.Button(toolbar, text="Open stereo pair…", command=self._open_videos).pack(
             side=tk.RIGHT
         )
@@ -269,6 +274,8 @@ class StereoViewerApp:
         stream.gru_stream_frame_index = None
         stream.mog2_stream_frame_index = None
         stream.frame_filter.reset()
+        if stream.camera_reader is not None:
+            stream.camera_reader.set_frame_consumer(None)
         if stream.writer is not None:
             stream.writer.release()
             stream.writer = None
@@ -677,6 +684,30 @@ class StereoViewerApp:
                     saved += f", extended {', '.join(extended_labels)}"
                 saved += ")"
             self.status_var.set(f"{saved}. Switch to Playback to review.")
+
+    def _open_calibration(self) -> None:
+        frames = capture_stereo_pair(
+            mode=self.mode.get(),
+            frame_index=self.frame_index,
+            left_last_raw=self.left.last_raw_frame,
+            right_last_raw=self.right.last_raw_frame,
+            left_cap=self.left.cap,
+            right_cap=self.right.cap,
+        )
+        if frames is None:
+            messagebox.showwarning(
+                "No frames",
+                "Open cameras or a stereo video pair and show a frame before calibrating.",
+                parent=self.root,
+            )
+            return
+        left_frame, right_frame = frames
+        TableCalibrationDialog(
+            self.root,
+            left_frame,
+            right_frame,
+            STEREO_DISPLAY_MAX_SIZE,
+        ).show()
 
     def _open_videos(self) -> None:
         left_path = filedialog.askopenfilename(

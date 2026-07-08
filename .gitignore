@@ -21,5 +21,8 @@ throw_detection/training_sets/
 # Trained throw-detection GRU weights
 throw_detection/models/
 
+# Camera / table calibration (repo root)
+calibration.json
+
 # Downloaded model weights
 *.pt

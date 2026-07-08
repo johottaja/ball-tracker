@@ -20,6 +20,8 @@ from video_viewer.config import THROW_MODEL_PATH
 from video_viewer.filters import _extract_wrist_pos
 from video_viewer.stereo_ball_detection import detect_stereo_balls
 
+from calibration import TableCalibration
+
 from .config import GAME_JSON
 from .game_data import GameSession, Point2D, ThrowRecord, new_game_session, save_game
 from .setup_config import CameraSetup
@@ -43,6 +45,7 @@ class GameTrackingProcessor:
         self._secondary_motion = MotionMaskBuilder()
         self._framesync_engine = FrameSyncEngine()
         self._setup = CameraSetup()
+        self._calibration: TableCalibration | None = None
         self._session: GameSession | None = None
         self._game_json_path = GAME_JSON
         self._on_throw_recorded: Callable[[ThrowRecord], None] | None = None
@@ -68,6 +71,9 @@ class GameTrackingProcessor:
         self._setup = setup
         if self._session is not None:
             self._session.camera_setup = setup
+
+    def set_calibration(self, calibration: TableCalibration | None) -> None:
+        self._calibration = calibration
 
     def set_on_throw_recorded(self, callback: Callable[[ThrowRecord], None] | None) -> None:
         self._on_throw_recorded = callback
@@ -212,7 +218,7 @@ class GameTrackingProcessor:
         throw = triangulate_throw(
             left_track,
             right_track,
-            setup=self._setup,
+            calibration=self._calibration,
             frame_size=self._frame_size,
             fps=self._fps,
             throw_id=self._next_throw_id,

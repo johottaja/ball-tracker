@@ -13,3 +13,5 @@ POSE_INFERENCE_MAX_SIZE = 640
 
 # Shoulder → elbow → wrist for the dominant arm.
 JOINT_NAMES = ("shoulder", "elbow", "wrist")
+
+#continue from here: imrpove secondary camera ball tracking beginning.

@@ -192,6 +192,8 @@ class VideoViewerApp:
         self.playback_cache.clear()
         self.frame_filter.reset()
         self.playing = False
+        if self.camera_reader is not None:
+            self.camera_reader.set_frame_consumer(None)
         if self.writer is not None:
             self.writer.release()
             self.writer = None
