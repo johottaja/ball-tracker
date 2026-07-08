@@ -117,15 +117,12 @@ balltracker/
 ├── game_tracker/             # Production game recorder + 3D throw tracking
 │   ├── __init__.py
 │   ├── __main__.py           # `python -m game_tracker` entry
-│   ├── app.py                # GameTrackerApp — record/playback, ball method, camera setup
-│   ├── config.py             # Paths, default geometry, triangulation thresholds
+│   ├── app.py                # GameTrackerApp — record/playback, ball method, calibration
+│   ├── config.py             # Paths, triangulation thresholds
 │   ├── display.py            # Re-exports stereo_viewer display helpers
-│   ├── setup_config.py       # CameraSetup dataclass + load/save camera_setup.json
-│   ├── setup_dialog.py       # Camera geometry popup
 │   ├── processor.py          # GameTrackingProcessor — stereo tracking + JSON export
-│   ├── triangulation.py      # Camera poses, cv2.triangulatePoints, 3D curve fit
+│   ├── triangulation.py      # Projection-matrix triangulation, 3D curve fit
 │   ├── game_data.py          # GameSession / ThrowRecord JSON schema
-│   ├── camera_setup.json     # Persisted geometry (optional, runtime)
 │   └── recordings/           # left.mp4, right.mp4, game.json (gitignored)
 ├── calibration/              # Table-corner calibration UI + homography storage
 │   ├── __init__.py
@@ -170,17 +167,16 @@ balltracker/
 | `types.py` | `Joint`, `DominantHand`, `DominantHandSequence` |
 | `config.py` | `POSE_MODEL_PATH`, `POSE_DEVICE`, `POSE_CONF_THRESHOLD`, `POSE_KEYPOINT_MIN_CONF` |
 | **stereo_viewer** | |
-| `stereo_viewer/app.py` | `StereoViewerApp` — two camera streams, side-by-side preview/playback, independent `FrameFilter` per camera (or coordinated **Stereo tracking**); extends the shorter recording on stop using capture timestamps |
+| `stereo_viewer/app.py` | `StereoViewerApp` — two camera streams, side-by-side preview/playback, independent `FrameFilter` per camera (or coordinated **Stereo tracking**); extends the shorter recording on stop using capture timestamps; **Import from game tracker** copies `game_tracker/recordings/left.mp4` and `right.mp4` into stereo viewer recordings |
 | `stereo_viewer/config.py` | `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `STEREO_DISPLAY_MAX_SIZE` |
 | `stereo_viewer/display.py` | `panel_size_for_frame`, `stereo_frame_to_photo` (horizontal composite) |
 | `stereo_viewer/stereo_tracking.py` | `StereoTrackingProcessor` — main GRU + ball track on both cameras; secondary ball-only track |
 | `stereo_viewer/frame_sync.py` | `FrameSyncProcessor` — ball drop/bounce sync on both cameras via `FrameSyncEngine` |
 | **game_tracker** | |
-| `game_tracker/app.py` | `GameTrackerApp` — dual-camera record/playback, ball-detection method, camera setup popup; always-on `GameTrackingProcessor` |
-| `game_tracker/config.py` | `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `GAME_JSON`, `SETUP_JSON`, default geometry |
-| `game_tracker/setup_config.py` | `CameraSetup` dataclass; load/save `camera_setup.json` on startup / dialog save / app close |
+| `game_tracker/app.py` | `GameTrackerApp` — dual-camera record/playback, ball-detection method, table calibration; always-on `GameTrackingProcessor` |
+| `game_tracker/config.py` | `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `GAME_JSON` |
 | `game_tracker/processor.py` | `GameTrackingProcessor` — stereo GRU + ball tracking, frame-indexed 2D capture, triangulation, incremental `game.json` writes |
-| `game_tracker/triangulation.py` | Look-at camera poses from setup; `cv2.triangulatePoints`; quadratic 3D curve fit; speed from 3D arc length |
+| `game_tracker/triangulation.py` | `cv2.triangulatePoints` from calibration projection matrices; quadratic 3D curve fit; speed from 3D arc length |
 | `game_tracker/game_data.py` | `GameSession`, `ThrowRecord`, JSON save/load (atomic temp + rename) |
 | **video_viewer** | |
 | `app.py` | `VideoViewerApp` — modes (record/playback), UI, frame stepping, filter wiring |
@@ -303,15 +299,15 @@ Tune via `trajectory_tracking/config.py`: `SECTOR_ANGLE_DEG`, `SECTOR_DIRECTION_
 
 Production app for recording a beer pong session and exporting 3D throw trajectories to JSON.
 
-**UI:** Same record/playback/camera-selection shell as `stereo_viewer`, but **no display filters**. Ball detection method combobox only (MOG2 + closing, frame diff, hybrid, or hybrid stacked). **Camera setup…** button opens a popup for geometry fields (distances, heights, inter-camera angle, horizontal FOV). Settings persist in `game_tracker/camera_setup.json` (auto-loaded on startup, saved on dialog Save and app close).
+**UI:** Same record/playback/camera-selection shell as `stereo_viewer`, but **no display filters**. Ball detection method combobox only (MOG2 + closing, frame diff, hybrid, or hybrid stacked). **Calibrate** opens the shared table-corner calibration dialog (saves `calibration.json` at repo root).
 
 **Recording:** Raw frames to `game_tracker/recordings/left.mp4` and `right.mp4`. On stop, the shorter clip is extended to match the longer using capture timestamps (`extend_video_to_reference`; same procedure as `stereo_viewer`). Fresh `game.json` session header written on stop.
 
 **Tracking (`GameTrackingProcessor`):** Active during playback (live record shows raw frames). Main (left) camera: GRU throw inference + wrist-anchored ball tracking. Secondary (right): ball tracking driven by main throw label. Stereo phase gate (`AWAITING_PARTNER`) pairs valid completions across cameras; failed tracks adopt the partner phase via `trajectory_tracking.stereo.reconcile_stereo_trackers`. Shared stereo ball detection (`video_viewer.stereo_ball_detection`) feeds both trajectory tracking and an embedded `FrameSyncEngine`. Frame-indexed 2D detections captured during `TRACKING_BALL`; when both cameras complete a throw, `triangulate_throw` pairs left/right points using the measured framesync offset (linear interpolation on the secondary track) and `calibration.json` homographies.
 
-**3D coordinate system:** Origin at table center; X along table length, Y along width, Z up from table (meters). **Calibrate** saves 3×4 projection matrices per camera (derived from corner clicks + focal-length estimation at save time). Per-point triangulation via `cv2.triangulatePoints` on temporally aligned 2D pairs (`secondary_frame = main_frame + offset` when offset is known). Video frame size must match the calibration frame size. 3D speed from fitted curve arc length ÷ throw duration. Requires `calibration.json` at repo root (saved via **Calibrate**); legacy **Camera setup…** dialog persists `camera_setup.json` for metadata only.
+**3D coordinate system:** Origin at table center; X along table length, Y along width, Z up from table (meters). **Calibrate** saves 3×4 projection matrices per camera (derived from corner clicks + focal-length estimation at save time). Per-point triangulation via `cv2.triangulatePoints` on temporally aligned 2D pairs (`secondary_frame = main_frame + offset` when offset is known). Video frame size must match the calibration frame size. 3D speed from fitted curve arc length ÷ throw duration. Requires `calibration.json` at repo root (saved via **Calibrate**).
 
-**`game.json` schema (version 1):** `recorded_at`, `fps`, `frame_count`, `videos`, `camera_setup`, `coordinate_system`, `throws[]` with `id`, `start_frame`, `end_frame`, `points_3d`, `fitted_curve_3d`, `speed_m_s`, `tracks_2d` (left/right pixel tracks). Designed for consumption by a future React SPA.
+**`game.json` schema (version 1):** `recorded_at`, `fps`, `frame_count`, `videos`, `coordinate_system`, `throws[]` with `id`, `start_frame`, `end_frame`, `points_3d`, `fitted_curve_3d`, `speed_m_s`, `tracks_2d` (left/right pixel tracks). Designed for consumption by a future React SPA.
 
 ## Frame sync (`framesync`)
 
@@ -348,8 +344,7 @@ Tune via `framesync/config.py`: `DROP_STREAK_FRAMES`, `MAX_HORIZONTAL_DELTA_PX`,
 
 **`game_tracker/config.py`**
 
-- **Paths:** `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `GAME_JSON`, `SETUP_JSON`
-- **Default geometry:** `DEFAULT_MAIN_DISTANCE_M`, `DEFAULT_SECONDARY_DISTANCE_M`, `DEFAULT_MAIN_HEIGHT_M`, `DEFAULT_SECONDARY_HEIGHT_M`, `DEFAULT_CAMERA_ANGLE_DEG`, `DEFAULT_HORIZONTAL_FOV_DEG`
+- **Paths:** `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `GAME_JSON`
 - **Triangulation:** `MAX_TRIANGULATION_HEIGHT_M`, `MAX_TRIANGULATION_RESIDUAL_M`
 
 **`pose_detection/config.py`**

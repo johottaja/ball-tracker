@@ -1,8 +1,0 @@
-{
-  "main_distance_m": 1.2,
-  "secondary_distance_m": 1.5,
-  "main_height_m": 0.8,
-  "secondary_height_m": 0.9,
-  "camera_angle_deg": 90.0,
-  "horizontal_fov_deg": 70.0
-}

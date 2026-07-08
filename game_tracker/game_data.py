@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from .config import GAME_JSON, LEFT_VIDEO, RIGHT_VIDEO
-from .setup_config import CameraSetup
 
 COORDINATE_SYSTEM = {
     "origin": "table_center",
@@ -84,7 +83,6 @@ class GameSession:
     fps: float = 30.0
     frame_count: int = 0
     videos: dict[str, str] | None = None
-    camera_setup: CameraSetup | None = None
     coordinate_system: dict[str, str] | None = None
     throws: list[ThrowRecord] | None = None
 
@@ -105,7 +103,6 @@ class GameSession:
             "fps": self.fps,
             "frame_count": self.frame_count,
             "videos": self.videos,
-            "camera_setup": self.camera_setup.to_dict() if self.camera_setup else {},
             "coordinate_system": self.coordinate_system,
             "throws": [t.to_dict() for t in (self.throws or [])],
         }
@@ -146,14 +143,12 @@ class GameSession:
                 )
             )
 
-        setup_data = data.get("camera_setup", {})
         return cls(
             version=int(data.get("version", 1)),
             recorded_at=str(data.get("recorded_at", "")),
             fps=float(data.get("fps", 30.0)),
             frame_count=int(data.get("frame_count", 0)),
             videos=data.get("videos"),
-            camera_setup=CameraSetup.from_dict(setup_data) if setup_data else None,
             coordinate_system=data.get("coordinate_system"),
             throws=throws,
         )
@@ -163,13 +158,11 @@ def new_game_session(
     *,
     fps: float,
     frame_count: int,
-    camera_setup: CameraSetup,
 ) -> GameSession:
     return GameSession(
         recorded_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         fps=fps,
         frame_count=frame_count,
-        camera_setup=camera_setup,
     )
 
 

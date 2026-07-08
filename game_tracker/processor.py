@@ -24,7 +24,6 @@ from calibration import TableCalibration
 
 from .config import GAME_JSON
 from .game_data import GameSession, Point2D, ThrowRecord, new_game_session, save_game
-from .setup_config import CameraSetup
 from .triangulation import triangulate_throw
 
 
@@ -44,7 +43,6 @@ class GameTrackingProcessor:
         self._main_motion = MotionMaskBuilder()
         self._secondary_motion = MotionMaskBuilder()
         self._framesync_engine = FrameSyncEngine()
-        self._setup = CameraSetup()
         self._calibration: TableCalibration | None = None
         self._session: GameSession | None = None
         self._game_json_path = GAME_JSON
@@ -60,17 +58,13 @@ class GameTrackingProcessor:
         self._frame_size: tuple[int, int] | None = None
         self._fps: float = 30.0
         self._last_frame_index: int | None = None
+        self._auto_persist = True
 
         self.state = ProcessorState()
 
     @property
     def framesync_offset(self) -> float | None:
         return self._framesync_engine.latest_offset
-
-    def set_camera_setup(self, setup: CameraSetup) -> None:
-        self._setup = setup
-        if self._session is not None:
-            self._session.camera_setup = setup
 
     def set_calibration(self, calibration: TableCalibration | None) -> None:
         self._calibration = calibration
@@ -81,6 +75,12 @@ class GameTrackingProcessor:
     def set_ball_detection_method(self, method: BallDetectionMethod) -> None:
         self._main_motion.set_method(method)
         self._secondary_motion.set_method(method)
+
+    def set_auto_persist(self, enabled: bool) -> None:
+        self._auto_persist = enabled
+
+    def flush_session(self) -> None:
+        self._persist_session(force=True)
 
     def throw_buffer_size(self) -> int:
         inference = self._ensure_throw_inference()
@@ -102,7 +102,6 @@ class GameTrackingProcessor:
         self._session = new_game_session(
             fps=fps,
             frame_count=frame_count,
-            camera_setup=self._setup,
         )
         self._next_throw_id = 1
         self.state = ProcessorState()
@@ -112,7 +111,6 @@ class GameTrackingProcessor:
         self.reset_tracking()
         self._game_json_path = game_json_path
         self._session = session
-        self._setup = session.camera_setup or self._setup
         throws = session.throws or []
         self._next_throw_id = max((t.id for t in throws), default=0) + 1
         self.state = ProcessorState(
@@ -238,8 +236,8 @@ class GameTrackingProcessor:
         if self._on_throw_recorded is not None:
             self._on_throw_recorded(throw)
 
-    def _persist_session(self) -> None:
-        if self._session is not None:
+    def _persist_session(self, *, force: bool = False) -> None:
+        if self._session is not None and (force or self._auto_persist):
             save_game(self._game_json_path, self._session)
 
     def apply(
@@ -371,4 +369,4 @@ class GameTrackingProcessor:
 
         self._try_pair_throw(cache=cache.main if cache is not None else None)
 
-        return main_frame.copy(), secondary_frame.copy()
+        return main_frame, secondary_frame

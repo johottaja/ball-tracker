@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,8 @@ from video_viewer.playback_cache import PlaybackCache
 from video_viewer.recording import create_writer, extend_video_evenly, extend_video_to_reference
 
 from calibration import TableCalibrationDialog, capture_stereo_pair
+from game_tracker.config import LEFT_VIDEO as GAME_TRACKER_LEFT_VIDEO
+from game_tracker.config import RIGHT_VIDEO as GAME_TRACKER_RIGHT_VIDEO
 
 from .config import LEFT_VIDEO, RECORDINGS_DIR, RIGHT_VIDEO, STEREO_DISPLAY_MAX_SIZE, TARGET_FPS
 from .display import panel_size_for_frame, stereo_frame_to_photo
@@ -117,6 +120,11 @@ class StereoViewerApp:
         ttk.Button(toolbar, text="Calibrate", command=self._open_calibration).pack(
             side=tk.RIGHT, padx=(4, 0)
         )
+        ttk.Button(
+            toolbar,
+            text="Import from game tracker",
+            command=self._import_from_game_tracker,
+        ).pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Button(toolbar, text="Open stereo pair…", command=self._open_videos).pack(
             side=tk.RIGHT
         )
@@ -708,6 +716,44 @@ class StereoViewerApp:
             right_frame,
             STEREO_DISPLAY_MAX_SIZE,
         ).show()
+
+    def _import_from_game_tracker(self) -> None:
+        if self.recording:
+            messagebox.showwarning(
+                "Recording in progress",
+                "Stop recording before importing from game tracker.",
+                parent=self.root,
+            )
+            return
+
+        if not GAME_TRACKER_LEFT_VIDEO.is_file() or not GAME_TRACKER_RIGHT_VIDEO.is_file():
+            messagebox.showerror(
+                "No game tracker recording",
+                "game_tracker/recordings/left.mp4 and right.mp4 were not found.\n"
+                "Record a game in game tracker first.",
+                parent=self.root,
+            )
+            return
+
+        if LEFT_VIDEO.is_file() or RIGHT_VIDEO.is_file():
+            if not messagebox.askyesno(
+                "Overwrite stereo recordings?",
+                "This replaces stereo_viewer/recordings/left.mp4 and right.mp4 "
+                "with the current game tracker recordings.",
+                parent=self.root,
+            ):
+                return
+
+        self._release_capture()
+
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(GAME_TRACKER_LEFT_VIDEO, LEFT_VIDEO)
+        shutil.copy2(GAME_TRACKER_RIGHT_VIDEO, RIGHT_VIDEO)
+
+        self.left.video_path = LEFT_VIDEO
+        self.right.video_path = RIGHT_VIDEO
+        self.mode.set("playback")
+        self._enter_playback_mode()
 
     def _open_videos(self) -> None:
         left_path = filedialog.askopenfilename(

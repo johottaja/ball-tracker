@@ -8,11 +8,6 @@ from tkinter import filedialog, messagebox, ttk
 import cv2
 import numpy as np
 
-from video_viewer.ball_motion import (
-    BALL_DETECTION_METHOD_LABELS,
-    BallDetectionMethod,
-    uses_mog2_component,
-)
 from video_viewer.camera import (
     CameraDevice,
     CameraReader,
@@ -20,30 +15,23 @@ from video_viewer.camera import (
     open_camera,
     probe_cameras,
 )
-from video_viewer.playback import (
-    gru_warmup_for_playback,
-    stereo_ball_mask_playback_inputs,
-    read_frame_at,
-    step_index_by_seconds,
-)
-from video_viewer.playback_cache import PlaybackCache
+from video_viewer.playback import read_frame_at, step_index_by_seconds
 from video_viewer.recording import create_writer, extend_video_evenly, extend_video_to_reference
 
 from calibration import TableCalibration, TableCalibrationDialog, capture_stereo_pair, load_calibration
 
 from .config import (
     DISPLAY_MAX_SIZE,
-    GAME_JSON,
+    GAMES_DIR,
     LEFT_VIDEO,
     RECORDINGS_DIR,
     RIGHT_VIDEO,
     TARGET_FPS,
 )
 from .display import panel_size_for_frame, stereo_frame_to_photo
-from .game_data import load_game
-from .processor import GameTrackingProcessor
-from .setup_config import CameraSetup, load_setup_config, save_setup_config
-from .setup_dialog import CameraSetupDialog
+from .game_data import GameSession, load_game
+from .paths import latest_game_json
+from .process_dialog import ProcessGameDialog
 
 
 @dataclass
@@ -74,18 +62,15 @@ class GameTrackerApp:
         self.root.minsize(960, 520)
 
         RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        GAMES_DIR.mkdir(parents=True, exist_ok=True)
 
         self.mode = tk.StringVar(value="record")
         self.left = CameraStream("Left", LEFT_VIDEO)
         self.right = CameraStream("Right", RIGHT_VIDEO)
 
-        self.camera_setup = load_setup_config()
         self.calibration = load_calibration()
-        self.processor = GameTrackingProcessor()
-        self.processor.set_camera_setup(self.camera_setup)
-        self.processor.set_calibration(self.calibration)
-        self.processor.set_on_throw_recorded(self._on_throw_recorded)
-        self.playback_cache = PlaybackCache()
+        self.current_game_json: Path | None = None
+        self.loaded_session: GameSession | None = None
 
         self.recording = False
         self.playing = False
@@ -97,12 +82,6 @@ class GameTrackerApp:
         self.after_id: str | None = None
         self.panel_size = panel_size_for_frame(640, 480, DISPLAY_MAX_SIZE)
         self.cameras: list[CameraDevice] = []
-        self._setup_dialog = CameraSetupDialog(
-            root,
-            self.camera_setup,
-            on_save=self._on_camera_setup_saved,
-        )
-
         self._build_ui()
         self._bind_playback_keys()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -131,28 +110,12 @@ class GameTrackerApp:
         ttk.Button(toolbar, text="Calibrate", command=self._open_calibration).pack(
             side=tk.RIGHT, padx=(4, 0)
         )
-        ttk.Button(toolbar, text="Camera setup…", command=self._open_setup_dialog).pack(
+        ttk.Button(toolbar, text="Process game…", command=self._open_process_dialog).pack(
             side=tk.RIGHT, padx=(4, 0)
         )
         ttk.Button(toolbar, text="Open stereo pair…", command=self._open_videos).pack(
             side=tk.RIGHT
         )
-
-        controls = ttk.Frame(self.root, padding=(8, 4, 8, 0))
-        controls.pack(fill=tk.X)
-        ttk.Label(controls, text="Ball detection:").pack(side=tk.LEFT)
-        self.ball_method_var = tk.StringVar(value=BallDetectionMethod.MOG2_CLOSING.value)
-        self.ball_method_combo = ttk.Combobox(
-            controls,
-            values=[BALL_DETECTION_METHOD_LABELS[m] for m in BallDetectionMethod],
-            state="readonly",
-            width=28,
-        )
-        self.ball_method_combo.pack(side=tk.LEFT, padx=(4, 0))
-        self.ball_method_combo.set(
-            BALL_DETECTION_METHOD_LABELS[BallDetectionMethod.MOG2_CLOSING]
-        )
-        self.ball_method_combo.bind("<<ComboboxSelected>>", self._on_ball_method_change)
 
         self.video_label = ttk.Label(self.root, text="No video", anchor=tk.CENTER)
         self.video_label.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -220,31 +183,6 @@ class GameTrackerApp:
     def _streams(self) -> tuple[CameraStream, CameraStream]:
         return self.left, self.right
 
-    def _selected_ball_method(self) -> BallDetectionMethod:
-        selected = self.ball_method_combo.get()
-        for method, label in BALL_DETECTION_METHOD_LABELS.items():
-            if label == selected:
-                return method
-        return BallDetectionMethod(self.ball_method_var.get())
-
-    def _on_ball_method_change(self, _event: object | None = None) -> None:
-        method = self._selected_ball_method()
-        self.ball_method_var.set(method.value)
-        self.processor.set_ball_detection_method(self._selected_ball_method())
-        self.playback_cache.clear_motion_masks()
-        for stream in self._streams():
-            stream.gru_stream_frame_index = None
-            stream.mog2_stream_frame_index = None
-        self._refresh_visible_frame()
-
-    def _open_setup_dialog(self) -> None:
-        self._setup_dialog = CameraSetupDialog(
-            self.root,
-            self.camera_setup,
-            on_save=self._on_camera_setup_saved,
-        )
-        self._setup_dialog.show()
-
     def _open_calibration(self) -> None:
         frames = capture_stereo_pair(
             mode=self.mode.get(),
@@ -272,22 +210,90 @@ class GameTrackerApp:
 
     def _on_calibration_saved(self, calibration: TableCalibration) -> None:
         self.calibration = calibration
-        self.processor.set_calibration(calibration)
 
-    def _on_camera_setup_saved(self, setup: CameraSetup) -> None:
-        self.camera_setup = setup
-        self.processor.set_camera_setup(setup)
+    def _load_game_session(self, path: Path | None = None) -> None:
+        if path is None:
+            path = self.current_game_json or latest_game_json()
+        self.current_game_json = path
+        self.loaded_session = load_game(path) if path is not None else None
 
-    def _on_throw_recorded(self, _throw) -> None:
+    def _on_game_processed(self, game_json_path: Path, _throws: int) -> None:
+        self._load_game_session(game_json_path)
         self._update_status_extra()
+
+    def _stereo_video_metadata(self) -> tuple[float, int] | None:
+        left_path = self.left.video_path or self.left.default_video
+        right_path = self.right.video_path or self.right.default_video
+        if not left_path.is_file() or not right_path.is_file():
+            return None
+
+        left_cap = cv2.VideoCapture(str(left_path))
+        right_cap = cv2.VideoCapture(str(right_path))
+        if not left_cap.isOpened() or not right_cap.isOpened():
+            left_cap.release()
+            right_cap.release()
+            return None
+
+        left_count = int(left_cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        right_count = int(right_cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        fps = left_cap.get(cv2.CAP_PROP_FPS) or TARGET_FPS
+        left_cap.release()
+        right_cap.release()
+
+        if left_count and right_count:
+            frame_count = min(left_count, right_count)
+        else:
+            frame_count = max(left_count, right_count)
+        if frame_count <= 0:
+            return None
+        return fps, frame_count
+
+    def _open_process_dialog(
+        self,
+        *,
+        fps: float | None = None,
+        frame_count: int | None = None,
+    ) -> None:
+        if fps is None or frame_count is None:
+            metadata = self._stereo_video_metadata()
+            if metadata is None:
+                messagebox.showwarning(
+                    "No recording",
+                    "Record a game or open a stereo video pair first.",
+                    parent=self.root,
+                )
+                return
+            file_fps, file_frame_count = metadata
+            fps = fps if fps is not None else file_fps
+            frame_count = frame_count if frame_count is not None else file_frame_count
+
+        left_path = self.left.video_path or self.left.default_video
+        right_path = self.right.video_path or self.right.default_video
+        ProcessGameDialog(
+            self.root,
+            left_video=left_path,
+            right_video=right_path,
+            fps=fps,
+            frame_count=frame_count,
+            calibration=self.calibration,
+            on_complete=self._on_game_processed,
+        ).show()
 
     def _update_status_extra(self) -> None:
         base = self.status_var.get().split(" — throws:")[0]
-        throws = self.processor.state.throw_count
-        speed = self.processor.state.last_speed_m_s
+        if self.loaded_session is None or not self.loaded_session.throws:
+            return
+        throws = len(self.loaded_session.throws)
+        last_speed = self.loaded_session.throws[-1].speed_m_s
         extra = f" — throws: {throws}"
-        if speed is not None:
-            extra += f", last speed: {speed:.1f} m/s"
+        if last_speed is not None:
+            extra += f", last speed: {last_speed:.1f} m/s"
+        game_name = (
+            self.current_game_json.name
+            if self.current_game_json is not None
+            else "game"
+        )
+        extra += f" ({game_name})"
         self.status_var.set(base + extra)
 
     def _refresh_visible_frame(self) -> None:
@@ -343,8 +349,6 @@ class GameTrackerApp:
     def _release_capture(self) -> None:
         self._cancel_after()
         self.playing = False
-        self.processor.reset_tracking()
-        self.playback_cache.clear()
         for stream in self._streams():
             self._release_stream(stream)
 
@@ -455,7 +459,6 @@ class GameTrackerApp:
         self.right.camera_reader.start()
         self.left.last_raw_frame = left_frame
         self.right.last_raw_frame = right_frame
-        self.processor.reset_tracking()
 
         self.status_var.set(
             f"{self._camera_name(self.left.camera_index)} + "
@@ -519,12 +522,6 @@ class GameTrackerApp:
 
         return target_count, extended_labels
 
-    def _begin_game_session(self, frame_count: int) -> None:
-        self.processor.begin_session(
-            fps=self.record_fps,
-            frame_count=frame_count,
-        )
-
     def _enter_record_mode(self) -> None:
         self._release_capture()
         self.recording = False
@@ -572,68 +569,10 @@ class GameTrackerApp:
         height = int(self.left.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.panel_size = panel_size_for_frame(width, height, DISPLAY_MAX_SIZE)
         self.frame_index = 0
-        self.playback_cache.clear()
-
-        existing = load_game(GAME_JSON)
-        if existing is not None:
-            self.processor.load_session(existing)
-        else:
-            self.processor.begin_session(
-                fps=self.fps,
-                frame_count=self.frame_count,
-            )
+        self._load_game_session()
 
         self._show_frame_at(0)
         self._update_status()
-
-    def _playback_warmup_inputs(
-        self, frame_index: int
-    ) -> tuple[
-        np.ndarray | None,
-        np.ndarray | None,
-        np.ndarray | None,
-        np.ndarray | None,
-        list[np.ndarray] | None,
-        list[np.ndarray] | None,
-        list[np.ndarray] | None,
-        int | None,
-    ]:
-        left_warmup, left_warmup_start_index = gru_warmup_for_playback(
-            self.left.cap,
-            frame_index,
-            self.left.gru_stream_frame_index,
-            self.processor.throw_buffer_size(),
-            self.playback_cache.main,
-        )
-        method = self._selected_ball_method()
-        (
-            left_previous,
-            right_previous,
-            left_next,
-            right_next,
-            left_mog2_warmup,
-            right_mog2_warmup,
-        ) = stereo_ball_mask_playback_inputs(
-            self.left.cap,
-            self.right.cap,
-            method,
-            frame_index,
-            self.left.mog2_stream_frame_index,
-            self.right.mog2_stream_frame_index,
-            self.playback_cache.main,
-            self.playback_cache.secondary,
-            self.frame_count,
-        )
-        return (
-            left_previous,
-            right_previous,
-            left_next,
-            right_next,
-            left_mog2_warmup,
-            right_mog2_warmup,
-            left_warmup,
-            left_warmup_start_index,
-        )
 
     def _show_raw_stereo(
         self, left_frame: np.ndarray, right_frame: np.ndarray
@@ -641,44 +580,6 @@ class GameTrackerApp:
         self.frame_photo = stereo_frame_to_photo(
             left_frame, right_frame, self.panel_size
         )
-        self.video_label.configure(image=self.frame_photo, text="")
-
-    def _display_stereo_frames(
-        self,
-        left_frame: np.ndarray,
-        right_frame: np.ndarray,
-        *,
-        frame_index: int = 0,
-        left_previous: np.ndarray | None = None,
-        right_previous: np.ndarray | None = None,
-        left_next: np.ndarray | None = None,
-        right_next: np.ndarray | None = None,
-        left_mog2_warmup: list[np.ndarray] | None = None,
-        right_mog2_warmup: list[np.ndarray] | None = None,
-        left_warmup: list[np.ndarray] | None = None,
-        left_warmup_start_index: int | None = None,
-        video_fps: float | None = None,
-    ) -> None:
-        if self.mode.get() == "record":
-            self._show_raw_stereo(left_frame, right_frame)
-            return
-
-        left_out, right_out = self.processor.apply(
-            left_frame,
-            right_frame,
-            frame_index=frame_index,
-            main_warmup_frames=left_warmup,
-            main_warmup_start_index=left_warmup_start_index,
-            main_previous_frame=left_previous,
-            main_next_frame=left_next,
-            main_mog2_warmup_frames=left_mog2_warmup,
-            secondary_previous_frame=right_previous,
-            secondary_next_frame=right_next,
-            secondary_mog2_warmup_frames=right_mog2_warmup,
-            video_fps=video_fps,
-            cache=self.playback_cache,
-        )
-        self.frame_photo = stereo_frame_to_photo(left_out, right_out, self.panel_size)
         self.video_label.configure(image=self.frame_photo, text="")
 
     def _schedule_record_preview(self) -> None:
@@ -745,7 +646,6 @@ class GameTrackerApp:
                 stream.recorded_timestamps = []
 
             self.recording = True
-            self.processor.reset_tracking()
             if self.left.camera_reader is not None:
                 self.left.camera_reader.set_frame_consumer(
                     self._make_frame_consumer(self.left)
@@ -780,18 +680,14 @@ class GameTrackerApp:
             self.record_btn.configure(text="Start recording")
             self._set_camera_controls_enabled(True)
 
-            self._begin_game_session(frame_count)
-            self.processor.reset_tracking()
-
             saved = f"Saved {LEFT_VIDEO.name} and {RIGHT_VIDEO.name}"
             if frame_count > 0:
                 saved += f" ({frame_count} frames each"
                 if extended_labels:
                     saved += f", extended {', '.join(extended_labels)}"
                 saved += ")"
-            self.status_var.set(
-                f"{saved}. Switch to Playback to analyze throws."
-            )
+            self.status_var.set(saved)
+            self._open_process_dialog(fps=self.record_fps, frame_count=frame_count)
 
     def _open_videos(self) -> None:
         left_path = filedialog.askopenfilename(
@@ -833,39 +729,7 @@ class GameTrackerApp:
             return False
 
         self.frame_index = index
-        video_fps = self.fps
-
-        (
-            left_previous,
-            right_previous,
-            left_next,
-            right_next,
-            left_mog2_warmup,
-            right_mog2_warmup,
-            left_warmup,
-            left_warmup_start_index,
-        ) = self._playback_warmup_inputs(index)
-
-        self._display_stereo_frames(
-            left_frame,
-            right_frame,
-            frame_index=self.frame_index,
-            left_previous=left_previous,
-            right_previous=right_previous,
-            left_next=left_next,
-            right_next=right_next,
-            left_mog2_warmup=left_mog2_warmup,
-            right_mog2_warmup=right_mog2_warmup,
-            left_warmup=left_warmup,
-            left_warmup_start_index=left_warmup_start_index,
-            video_fps=video_fps,
-        )
-
-        self.left.gru_stream_frame_index = self.frame_index
-        if uses_mog2_component(self._selected_ball_method()):
-            self.left.mog2_stream_frame_index = self.frame_index
-            self.right.mog2_stream_frame_index = self.frame_index
-
+        self._show_raw_stereo(left_frame, right_frame)
         self._update_status()
         return True
 
@@ -980,6 +844,5 @@ class GameTrackerApp:
         self.after_id = self.root.after(1, self._schedule_playback)
 
     def _on_close(self) -> None:
-        save_setup_config(self.camera_setup)
         self._release_capture()
         self.root.destroy()

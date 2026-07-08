@@ -66,6 +66,21 @@ class PoseDetector:
             self._model = YOLO(str(POSE_MODEL_PATH))
         return self._model
 
+    @staticmethod
+    def _people_from_result(
+        result: object,
+        scale_x: float,
+        scale_y: float,
+    ) -> list[np.ndarray]:
+        if result.keypoints is None:
+            return []
+        keypoints = result.keypoints.data.cpu().numpy()
+        return [
+            _scale_keypoints(person, scale_x, scale_y)
+            for person in keypoints
+            if person.shape[0] >= 17
+        ]
+
     def detect(self, frame: np.ndarray) -> list[np.ndarray]:
         """Return keypoint arrays shaped (17, 3) as x, y, confidence per person."""
         inference_frame, scale_x, scale_y = _prepare_inference_frame(frame)
@@ -80,11 +95,33 @@ class PoseDetector:
         if not results or results[0].keypoints is None:
             return []
 
-        keypoints = results[0].keypoints.data.cpu().numpy()
+        return self._people_from_result(results[0], scale_x, scale_y)
+
+    def detect_batch(self, frames: list[np.ndarray]) -> list[list[np.ndarray]]:
+        """Run pose inference on a batch of frames (one person-keypoint list per frame)."""
+        if not frames:
+            return []
+
+        prepared: list[np.ndarray] = []
+        scales: list[tuple[float, float]] = []
+        for frame in frames:
+            inference_frame, scale_x, scale_y = _prepare_inference_frame(frame)
+            prepared.append(inference_frame)
+            scales.append((scale_x, scale_y))
+
+        model = self._ensure_model()
+        imgsz = max(max(frame.shape[:2]) for frame in prepared)
+        results = model(
+            prepared,
+            conf=POSE_CONF_THRESHOLD,
+            device=POSE_DEVICE,
+            verbose=False,
+            imgsz=imgsz,
+        )
+
         return [
-            _scale_keypoints(person, scale_x, scale_y)
-            for person in keypoints
-            if person.shape[0] >= 17
+            self._people_from_result(result, scale_x, scale_y)
+            for result, (scale_x, scale_y) in zip(results, scales)
         ]
 
 
@@ -186,6 +223,20 @@ def select_dominant_hand(
     if detection is None:
         return None
     return detection.hand
+
+
+def dominant_hand_detection_from_keypoints(
+    person_keypoints: np.ndarray,
+    side: HandSide,
+) -> DominantHandDetection | None:
+    """Rebuild a dominant-hand detection from stored person keypoints and side."""
+    joints = _hand_joints(person_keypoints, side)
+    if joints is None:
+        return None
+    return DominantHandDetection(
+        hand=DominantHand(side=side, joints=joints),
+        person_keypoints=person_keypoints,
+    )
 
 
 def detect_dominant_hand_detection(
