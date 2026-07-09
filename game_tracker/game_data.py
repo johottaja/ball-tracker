@@ -8,6 +8,8 @@ from typing import Any
 
 from .config import GAME_JSON, LEFT_VIDEO, RIGHT_VIDEO
 
+from calibration import TableCalibration
+
 COORDINATE_SYSTEM = {
     "origin": "table_center",
     "x": "table_length",
@@ -84,6 +86,7 @@ class GameSession:
     frame_count: int = 0
     videos: dict[str, str] | None = None
     coordinate_system: dict[str, str] | None = None
+    calibration: TableCalibration | None = None
     throws: list[ThrowRecord] | None = None
 
     def __post_init__(self) -> None:
@@ -97,7 +100,7 @@ class GameSession:
             self.throws = []
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "version": self.version,
             "recorded_at": self.recorded_at,
             "fps": self.fps,
@@ -106,6 +109,9 @@ class GameSession:
             "coordinate_system": self.coordinate_system,
             "throws": [t.to_dict() for t in (self.throws or [])],
         }
+        if self.calibration is not None:
+            d["calibration"] = self.calibration.to_dict()
+        return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> GameSession:
@@ -143,6 +149,13 @@ class GameSession:
                 )
             )
 
+        calibration_data = data.get("calibration")
+        calibration = (
+            TableCalibration.from_dict(calibration_data)
+            if isinstance(calibration_data, dict)
+            else None
+        )
+
         return cls(
             version=int(data.get("version", 1)),
             recorded_at=str(data.get("recorded_at", "")),
@@ -150,6 +163,7 @@ class GameSession:
             frame_count=int(data.get("frame_count", 0)),
             videos=data.get("videos"),
             coordinate_system=data.get("coordinate_system"),
+            calibration=calibration,
             throws=throws,
         )
 
@@ -158,11 +172,13 @@ def new_game_session(
     *,
     fps: float,
     frame_count: int,
+    calibration: TableCalibration | None = None,
 ) -> GameSession:
     return GameSession(
         recorded_at=datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
         fps=fps,
         frame_count=frame_count,
+        calibration=calibration,
     )
 
 

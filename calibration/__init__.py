@@ -4,32 +4,56 @@ from .homography import (
     build_table_calibration,
     compute_image_to_world_homography,
     estimate_focal_length,
+    focal_length_from_horizontal_fov,
     image_to_table_plane,
+    intrinsic_matrix_from_focal_length,
     intrinsic_matrix_from_homography,
-    order_quad_cyclic,
     projection_matrix_from_corners,
     projection_matrix_from_homography,
-    resolve_corner_mapping,
     table_corner_world_coords,
 )
-from .storage import load_calibration, save_calibration
-from .types import CameraCalibration, TableCalibration
+from .layout import (
+    CameraLayoutInfo,
+    compute_calibration_layout,
+    compute_camera_layout,
+    compute_stereo_layout_stats,
+    layout_info_from_calibration,
+)
+from .layout_dialog import CameraLayoutDialog
+from .storage import attach_layout_stats, load_calibration, save_calibration
+from .types import (
+    CalibrationLayout,
+    CameraCalibration,
+    CameraLayoutStats,
+    StereoLayoutStats,
+    TableCalibration,
+)
 
 __all__ = [
+    "CalibrationLayout",
     "CameraCalibration",
+    "CameraLayoutDialog",
+    "CameraLayoutInfo",
+    "CameraLayoutStats",
+    "StereoLayoutStats",
     "TableCalibration",
     "TableCalibrationDialog",
+    "attach_layout_stats",
     "build_table_calibration",
     "capture_stereo_pair",
+    "compute_calibration_layout",
+    "compute_camera_layout",
     "compute_image_to_world_homography",
+    "compute_stereo_layout_stats",
     "estimate_focal_length",
+    "focal_length_from_horizontal_fov",
     "image_to_table_plane",
+    "intrinsic_matrix_from_focal_length",
     "intrinsic_matrix_from_homography",
+    "layout_info_from_calibration",
     "load_calibration",
-    "order_quad_cyclic",
     "projection_matrix_from_corners",
     "projection_matrix_from_homography",
-    "resolve_corner_mapping",
     "save_calibration",
     "table_corner_world_coords",
 ]

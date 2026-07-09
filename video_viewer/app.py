@@ -8,7 +8,7 @@ import cv2
 import numpy as np
 
 from .camera import CameraDevice, CameraReader, configure_camera_fps, open_camera, probe_cameras
-from .config import DEFAULT_VIDEO, RECORDINGS_DIR, TARGET_RECORD_FPS
+from .config import DEFAULT_VIDEO, RECORDINGS_DIR, TARGET_RECORD_FPS, YOLO_INFERENCES
 from .display import fit_size
 from .filter_controls import FilterControls
 from .filters import FrameFilter
@@ -21,6 +21,8 @@ from .playback import (
     uses_mog2_streaming,
 )
 from .playback_cache import PlaybackCache
+from .pose_estimation import PoseEstimationPanel
+from .recording import create_writer
 
 
 class VideoViewerApp:
@@ -54,6 +56,7 @@ class VideoViewerApp:
         self._last_raw_frame: np.ndarray | None = None
         self._gru_stream_frame_index: int | None = None
         self._mog2_stream_frame_index: int | None = None
+        self._playback_transport_widgets: list[tk.Widget] = []
 
         self._build_ui()
         self._build_menu()
@@ -128,24 +131,49 @@ class VideoViewerApp:
         self.playback_controls = ttk.Frame(self.root, padding=8)
         btn_row = ttk.Frame(self.playback_controls)
         btn_row.pack()
-        ttk.Button(btn_row, text="|◀ Beginning", command=self._go_to_start).pack(
-            side=tk.LEFT, padx=2
-        )
-        step_back_btn = ttk.Button(btn_row, text="◀ Frame")
-        step_back_btn.pack(side=tk.LEFT, padx=2)
+        self._playback_transport_widgets = [
+            ttk.Button(btn_row, text="|◀ Beginning", command=self._go_to_start),
+            ttk.Button(btn_row, text="◀ Frame"),
+            ttk.Button(btn_row, text="Play", command=self._play),
+            ttk.Button(btn_row, text="Pause", command=self._pause),
+            ttk.Button(btn_row, text="Frame ▶"),
+        ]
+        for index, widget in enumerate(self._playback_transport_widgets):
+            widget.pack(side=tk.LEFT, padx=2)
+        step_back_btn = self._playback_transport_widgets[1]
+        step_forward_btn = self._playback_transport_widgets[4]
         step_back_btn.bind("<Button-1>", self._on_step_backward_click)
-        ttk.Button(btn_row, text="Play", command=self._play).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="Pause", command=self._pause).pack(
-            side=tk.LEFT, padx=2
-        )
-        step_forward_btn = ttk.Button(btn_row, text="Frame ▶")
-        step_forward_btn.pack(side=tk.LEFT, padx=2)
         step_forward_btn.bind("<Button-1>", self._on_step_forward_click)
+
+        self.pose_estimation = PoseEstimationPanel(
+            self.playback_controls,
+            self.root,
+            layout="mono",
+            cache_path=YOLO_INFERENCES,
+            on_busy_change=self._on_pose_estimation_busy,
+            on_complete=self._refresh_visible_frame,
+        )
 
     def _build_menu(self) -> None:
         menubar = tk.Menu(self.root)
         self.root.config(menu=menubar)
         self.filter_controls.add_menu(menubar)
+
+    def _on_pose_estimation_busy(self, busy: bool) -> None:
+        self._set_playback_transport_enabled(not busy)
+        if busy:
+            self._pause()
+        if self.mode.get() == "playback":
+            self._update_status()
+
+    def _set_playback_transport_enabled(self, enabled: bool) -> None:
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for widget in self._playback_transport_widgets:
+            widget.configure(state=state)
+        self.pose_estimation.set_playback_controls_enabled(enabled)
+
+    def _playback_blocked(self) -> bool:
+        return self.pose_estimation.is_running
 
     def _on_filter_change(self) -> None:
         self._gru_stream_frame_index = None
@@ -304,6 +332,7 @@ class VideoViewerApp:
             self.writer.write(frame)
 
     def _enter_record_mode(self) -> None:
+        self.pose_estimation.on_leave_playback()
         self._release_capture()
         self.recording = False
         self.record_btn.configure(text="Start recording")
@@ -337,6 +366,10 @@ class VideoViewerApp:
         self.display_size = fit_size(width, height)
         self.frame_index = 0
         self.playback_cache.clear()
+        self.pose_estimation.set_playback_cache(self.playback_cache)
+        self.pose_estimation.set_frame_count(self.frame_count)
+        self.pose_estimation.set_mono_video(path)
+        self.pose_estimation.on_enter_playback()
         self._show_frame_at(0)
         self._update_status()
 
@@ -365,6 +398,8 @@ class VideoViewerApp:
                 )
                 self.writer = None
                 return
+            if YOLO_INFERENCES.is_file():
+                YOLO_INFERENCES.unlink()
             self.recording = True
             if self.camera_reader is not None:
                 self.camera_reader.set_frame_consumer(self._on_captured_frame)
@@ -403,6 +438,8 @@ class VideoViewerApp:
         self._enter_playback_mode()
 
     def _show_frame_at(self, index: int) -> bool:
+        if self._playback_blocked():
+            return False
         if self.cap is None:
             return False
         index = max(0, index)
@@ -476,7 +513,7 @@ class VideoViewerApp:
         time_s = self.frame_index / self.fps if self.fps else 0
         self.status_var.set(
             f"{name} — frame {self.frame_index + 1} / {total} "
-            f"({time_s:.2f}s @ {self.fps:.1f} fps)"
+            f"({time_s:.2f}s @ {self.fps:.1f} fps) — {self.pose_estimation.status_suffix()}"
         )
 
     def _bind_playback_keys(self) -> None:
@@ -496,6 +533,8 @@ class VideoViewerApp:
         self.root.focus_set()
 
     def _playback_key_handler(self, handler) -> str:
+        if self._playback_blocked():
+            return "break"
         handler()
         return "break"
 
@@ -550,6 +589,8 @@ class VideoViewerApp:
         )
 
     def _play(self) -> None:
+        if self._playback_blocked():
+            return
         if self.cap is None or self.mode.get() != "playback":
             return
         if self.frame_count and self.frame_index >= self.frame_count - 1:

@@ -6,6 +6,10 @@ from trajectory_tracking.config import BALL_CIRCULARITY_MAX, BALL_CIRCULARITY_MI
 PACKAGE_DIR = Path(__file__).resolve().parent
 RECORDINGS_DIR = PACKAGE_DIR / "recordings"
 DEFAULT_VIDEO = RECORDINGS_DIR / "recording.mp4"
+YOLO_INFERENCES = RECORDINGS_DIR / "yolo_inferences.npz"
+GRU_INFERENCES = RECORDINGS_DIR / "gru_inferences.npz"
+YOLO_BATCH_SIZE = 64
+GRU_BATCH_SIZE = 512
 
 DISPLAY_MAX_SIZE = (960, 540)
 MAX_CAMERA_PROBE = 10

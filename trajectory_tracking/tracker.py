@@ -166,13 +166,17 @@ class TrajectoryTracker:
             return
 
         if partner_phase == Phase.TRACKING_BALL:
+            if is_secondary:
+                if throw_label == 1 and wrist_pos is not None:
+                    self._enter_scanning(wrist_pos)
+                else:
+                    self._enter_scanning_full_frame()
+                return
             origin = partner.ball_search_origin()
             if origin is None:
                 self.exit_awaiting_partner()
                 return
-            if is_secondary:
-                self._enter_scanning_at_origin(origin)
-            elif throw_label == 1 and wrist_pos is not None:
+            if throw_label == 1 and wrist_pos is not None:
                 self._enter_scanning(wrist_pos)
             else:
                 self._enter_scanning_at_origin(origin)
@@ -180,13 +184,12 @@ class TrajectoryTracker:
 
         if partner_phase == Phase.SCANNING_BALL:
             if is_secondary:
-                if partner._full_frame_scan:
-                    self._enter_scanning_full_frame()
-                elif partner._scan_origin is not None:
-                    self._enter_scanning_at_origin(partner._scan_origin)
+                if throw_label == 1 and wrist_pos is not None:
+                    self._enter_scanning(wrist_pos)
                 else:
                     self._enter_scanning_full_frame()
-            elif throw_label == 1 and wrist_pos is not None:
+                return
+            if throw_label == 1 and wrist_pos is not None:
                 self._enter_scanning(wrist_pos)
             elif partner._scan_origin is not None:
                 self._enter_scanning_at_origin(partner._scan_origin)
@@ -343,6 +346,7 @@ class TrajectoryTracker:
         throw_label: int,
         motion_mask: np.ndarray | None,
         *,
+        wrist_pos: tuple[int, int] | None = None,
         alternate_motion_mask: np.ndarray | None = None,
         defer_detecting_throw: bool = False,
         frame_index: int | None = None,
@@ -350,8 +354,9 @@ class TrajectoryTracker:
         """
         Ball-only tracker for a secondary camera view.
 
-        Throw detection comes from the main camera (``throw_label`` only); ball
-        search starts with a full-frame scan because there is no wrist anchor.
+        Throw detection comes from the main camera (``throw_label`` only). During
+        scanning, uses ``wrist_pos`` from this camera's pose when available;
+        otherwise falls back to a full-frame ball search.
         """
         if self.phase == Phase.AWAITING_PARTNER:
             self._awaiting_frame_count += 1
@@ -363,23 +368,30 @@ class TrajectoryTracker:
 
         if self.phase == Phase.DETECTING_THROW:
             if throw_label == 1:
-                self._enter_scanning_full_frame()
+                if wrist_pos is not None:
+                    self._enter_scanning(wrist_pos)
+                else:
+                    self._enter_scanning_full_frame()
 
         elif self.phase == Phase.SCANNING_BALL:
             if throw_label == 1:
                 self._scan_frame_count = 0
+                if wrist_pos is not None:
+                    self._scan_origin = wrist_pos
+                    self._full_frame_scan = False
 
-            detected_pos = self._find_ball_merged(motion_mask, alternate_motion_mask)
-            if detected_pos is not None:
-                self._full_frame_scan = False
-                self._scan_origin = detected_pos
-                self._trajectory_points = [detected_pos]
-                self._trajectory_frames = (
-                    [frame_index] if frame_index is not None else []
-                )
-                self._miss_count = 0
-                self._tracking_frame_count = 1
-                self.phase = Phase.TRACKING_BALL
+            if self._full_frame_scan or self._scan_origin is not None:
+                detected_pos = self._find_ball_merged(motion_mask, alternate_motion_mask)
+                if detected_pos is not None:
+                    self._full_frame_scan = False
+                    self._scan_origin = detected_pos
+                    self._trajectory_points = [detected_pos]
+                    self._trajectory_frames = (
+                        [frame_index] if frame_index is not None else []
+                    )
+                    self._miss_count = 0
+                    self._tracking_frame_count = 1
+                    self.phase = Phase.TRACKING_BALL
 
             if self.phase == Phase.SCANNING_BALL and throw_label == 0:
                 self._scan_frame_count += 1
@@ -396,7 +408,10 @@ class TrajectoryTracker:
                     else:
                         self._mark_stereo_reconcile()
                 else:
-                    self._enter_scanning_full_frame()
+                    if wrist_pos is not None:
+                        self._enter_scanning(wrist_pos)
+                    else:
+                        self._enter_scanning_full_frame()
             else:
                 detected_pos = self._find_ball_merged(motion_mask, alternate_motion_mask)
 
@@ -513,6 +528,11 @@ class TrajectoryTracker:
 
         self._completed_tracking_frames = tracking_frames
         self._completion_id += 1
+        print(f"Completed trajectory: {self._completed_trajectory}")
+        print(f"Completed trajectory frames: {self._completed_trajectory_frames}")
+        print(f"Completed parabola fit: {self._completed_parabola_fit}")
+        print(f"Completed tracking frames: {self._completed_tracking_frames}")
+        print(f"Completion ID: {self._completion_id}")
         return True
 
     def _find_ball_merged(

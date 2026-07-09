@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import tkinter as tk
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -15,10 +16,39 @@ from video_viewer.camera import (
     open_camera,
     probe_cameras,
 )
-from video_viewer.playback import read_frame_at, step_index_by_seconds
-from video_viewer.recording import create_writer, extend_video_evenly, extend_video_to_reference
+from video_viewer.ball_motion import (
+    BALL_DETECTION_METHOD_LABELS,
+    BallDetectionMethod,
+    uses_mog2_component,
+)
+from video_viewer.config import THROW_MODEL_PATH
+from video_viewer.playback import step_index_by_seconds
+from video_viewer.playback_cache import PlaybackCache
+from video_viewer.recording import create_writer
+from video_viewer.stereo_playback import (
+    StereoFrameReader,
+    gru_warmup_for_timeline_playback,
+    stereo_timeline_ball_mask_inputs,
+)
+from video_viewer.stereo_timeline import (
+    STEREO_TIMELINE_FILENAME,
+    finalize_stereo_recording,
+    load_stereo_timeline_for_videos,
+    stereo_timeline_path_for,
+)
+from video_viewer.yolo_batch import try_load_pose_cache
+from video_viewer.gru_batch import try_load_gru_cache
+from stereo_viewer.config import LEFT_VIDEO as STEREO_VIEWER_LEFT_VIDEO
+from stereo_viewer.config import RIGHT_VIDEO as STEREO_VIEWER_RIGHT_VIDEO
+from stereo_viewer.stereo_tracking import StereoTrackingProcessor
 
-from calibration import TableCalibration, TableCalibrationDialog, capture_stereo_pair, load_calibration
+from calibration import (
+    CameraLayoutDialog,
+    TableCalibration,
+    TableCalibrationDialog,
+    capture_stereo_pair,
+    load_calibration,
+)
 
 from .config import (
     DISPLAY_MAX_SIZE,
@@ -27,6 +57,8 @@ from .config import (
     RECORDINGS_DIR,
     RIGHT_VIDEO,
     TARGET_FPS,
+    YOLO_INFERENCES,
+    GRU_INFERENCES,
 )
 from .display import panel_size_for_frame, stereo_frame_to_photo
 from .game_data import GameSession, load_game
@@ -80,6 +112,13 @@ class GameTrackerApp:
         self.record_fps = TARGET_FPS
         self.frame_photo = None
         self.after_id: str | None = None
+        self.stereo_timeline = None
+        self.stereo_reader: StereoFrameReader | None = None
+        self.stereo_tracking = StereoTrackingProcessor(enable_framesync=False)
+        self.playback_cache = PlaybackCache()
+        self.ball_method_var = tk.StringVar(
+            value=BALL_DETECTION_METHOD_LABELS[BallDetectionMethod.MOG2_CLOSING]
+        )
         self.panel_size = panel_size_for_frame(640, 480, DISPLAY_MAX_SIZE)
         self.cameras: list[CameraDevice] = []
         self._build_ui()
@@ -110,6 +149,14 @@ class GameTrackerApp:
         ttk.Button(toolbar, text="Calibrate", command=self._open_calibration).pack(
             side=tk.RIGHT, padx=(4, 0)
         )
+        ttk.Button(toolbar, text="Camera layout", command=self._open_camera_layout).pack(
+            side=tk.RIGHT, padx=(4, 0)
+        )
+        ttk.Button(
+            toolbar,
+            text="Import from stereo viewer",
+            command=self._import_from_stereo_viewer,
+        ).pack(side=tk.RIGHT, padx=(4, 0))
         ttk.Button(toolbar, text="Process game…", command=self._open_process_dialog).pack(
             side=tk.RIGHT, padx=(4, 0)
         )
@@ -166,6 +213,21 @@ class GameTrackerApp:
         self.record_btn.pack()
 
         self.playback_controls = ttk.Frame(self.root, padding=8)
+        ball_row = ttk.Frame(self.playback_controls)
+        ball_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(ball_row, text="Ball detection:").pack(side=tk.LEFT)
+        self.ball_method_combo = ttk.Combobox(
+            ball_row,
+            textvariable=self.ball_method_var,
+            state="readonly",
+            width=34,
+        )
+        self.ball_method_combo.pack(side=tk.LEFT, padx=(4, 0))
+        self.ball_method_combo.configure(
+            values=[BALL_DETECTION_METHOD_LABELS[m] for m in BallDetectionMethod]
+        )
+        self.ball_method_combo.bind("<<ComboboxSelected>>", self._on_ball_method_change)
+
         btn_row = ttk.Frame(self.playback_controls)
         btn_row.pack()
         ttk.Button(btn_row, text="|◀ Beginning", command=self._go_to_start).pack(
@@ -182,6 +244,51 @@ class GameTrackerApp:
 
     def _streams(self) -> tuple[CameraStream, CameraStream]:
         return self.left, self.right
+
+    def _selected_ball_method(self) -> BallDetectionMethod:
+        label = self.ball_method_var.get()
+        for method, method_label in BALL_DETECTION_METHOD_LABELS.items():
+            if method_label == label:
+                return method
+        return BallDetectionMethod.MOG2_CLOSING
+
+    def _on_ball_method_change(self, _event: object | None = None) -> None:
+        method = self._selected_ball_method()
+        self.stereo_tracking.set_ball_detection_method(method)
+        self.playback_cache.clear_filter_outputs()
+        self.playback_cache.clear_motion_masks()
+        for stream in self._streams():
+            stream.gru_stream_frame_index = None
+            stream.mog2_stream_frame_index = None
+        if self.mode.get() == "playback":
+            self._refresh_visible_frame()
+
+    def _load_playback_caches(self) -> None:
+        if self.frame_count <= 0:
+            return
+        if not try_load_pose_cache(
+            YOLO_INFERENCES,
+            self.frame_count,
+            "stereo",
+            self.playback_cache,
+        ):
+            return
+        if THROW_MODEL_PATH is not None and THROW_MODEL_PATH.is_file():
+            try_load_gru_cache(
+                GRU_INFERENCES,
+                self.frame_count,
+                THROW_MODEL_PATH,
+                self.playback_cache,
+                layout="stereo",
+            )
+
+    def _reset_playback_tracking(self) -> None:
+        self.stereo_tracking.reset()
+        self.playback_cache.clear_filter_outputs()
+        self.playback_cache.clear_motion_masks()
+        for stream in self._streams():
+            stream.gru_stream_frame_index = None
+            stream.mog2_stream_frame_index = None
 
     def _open_calibration(self) -> None:
         frames = capture_stereo_pair(
@@ -211,6 +318,9 @@ class GameTrackerApp:
     def _on_calibration_saved(self, calibration: TableCalibration) -> None:
         self.calibration = calibration
 
+    def _open_camera_layout(self) -> None:
+        CameraLayoutDialog(self.root, self.calibration).show()
+
     def _load_game_session(self, path: Path | None = None) -> None:
         if path is None:
             path = self.current_game_json or latest_game_json()
@@ -219,6 +329,11 @@ class GameTrackerApp:
 
     def _on_game_processed(self, game_json_path: Path, _throws: int) -> None:
         self._load_game_session(game_json_path)
+        if self.mode.get() == "playback" and self.stereo_reader is not None:
+            self.playback_cache.clear()
+            self._load_playback_caches()
+            self._reset_playback_tracking()
+            self._refresh_visible_frame()
         self._update_status_extra()
 
     def _stereo_video_metadata(self) -> tuple[float, int] | None:
@@ -240,10 +355,13 @@ class GameTrackerApp:
         left_cap.release()
         right_cap.release()
 
-        if left_count and right_count:
-            frame_count = min(left_count, right_count)
-        else:
-            frame_count = max(left_count, right_count)
+        timeline = load_stereo_timeline_for_videos(
+            left_path,
+            left_frame_count=left_count,
+            right_frame_count=right_count,
+            fps=fps,
+        )
+        frame_count = timeline.master_count
         if frame_count <= 0:
             return None
         return fps, frame_count
@@ -349,6 +467,10 @@ class GameTrackerApp:
     def _release_capture(self) -> None:
         self._cancel_after()
         self.playing = False
+        self.stereo_reader = None
+        self.stereo_timeline = None
+        self.playback_cache.clear()
+        self.stereo_tracking.reset()
         for stream in self._streams():
             self._release_stream(stream)
 
@@ -478,49 +600,28 @@ class GameTrackerApp:
 
         return on_frame
 
-    def _equalize_stereo_recordings(self) -> tuple[int, list[str]]:
+    def _finalize_stereo_recording(self) -> tuple[int, str]:
         left_count = self.left.recorded_frame_count
         right_count = self.right.recorded_frame_count
-        target_count = max(left_count, right_count)
-        extended_labels: list[str] = []
+        if (
+            left_count <= 0
+            or right_count <= 0
+            or not self.left.recorded_timestamps
+            or not self.right.recorded_timestamps
+        ):
+            return 0, ""
 
-        if left_count < target_count:
-            if self.left.recorded_timestamps and self.right.recorded_timestamps:
-                extend_video_to_reference(
-                    self.left.default_video,
-                    source_timestamps=self.left.recorded_timestamps,
-                    reference_timestamps=self.right.recorded_timestamps,
-                    source_count=left_count,
-                    fps=self.record_fps,
-                )
-            else:
-                extend_video_evenly(
-                    self.left.default_video,
-                    source_count=left_count,
-                    target_count=target_count,
-                    fps=self.record_fps,
-                )
-            extended_labels.append(f"left +{target_count - left_count}")
-
-        if right_count < target_count:
-            if self.left.recorded_timestamps and self.right.recorded_timestamps:
-                extend_video_to_reference(
-                    self.right.default_video,
-                    source_timestamps=self.right.recorded_timestamps,
-                    reference_timestamps=self.left.recorded_timestamps,
-                    source_count=right_count,
-                    fps=self.record_fps,
-                )
-            else:
-                extend_video_evenly(
-                    self.right.default_video,
-                    source_count=right_count,
-                    target_count=target_count,
-                    fps=self.record_fps,
-                )
-            extended_labels.append(f"right +{target_count - right_count}")
-
-        return target_count, extended_labels
+        timeline = finalize_stereo_recording(
+            left_timestamps=self.left.recorded_timestamps,
+            right_timestamps=self.right.recorded_timestamps,
+            fps=self.record_fps,
+            left_video=self.left.default_video,
+        )
+        detail = (
+            f"{timeline.master_count} master slots "
+            f"(left {left_count}, right {right_count}, ref {timeline.reference})"
+        )
+        return timeline.master_count, detail
 
     def _enter_record_mode(self) -> None:
         self._release_capture()
@@ -559,20 +660,74 @@ class GameTrackerApp:
 
         left_count = int(self.left.cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
         right_count = int(self.right.cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-        if left_count and right_count:
-            self.frame_count = min(left_count, right_count)
-        else:
-            self.frame_count = max(left_count, right_count)
-
         self.fps = self.left.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self.stereo_timeline = load_stereo_timeline_for_videos(
+            left_path,
+            left_frame_count=left_count,
+            right_frame_count=right_count,
+            fps=self.fps,
+        )
+        self.stereo_reader = StereoFrameReader(
+            self.left.cap,
+            self.right.cap,
+            self.stereo_timeline,
+        )
+        self.frame_count = self.stereo_timeline.master_count
         width = int(self.left.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(self.left.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.panel_size = panel_size_for_frame(width, height, DISPLAY_MAX_SIZE)
         self.frame_index = 0
         self._load_game_session()
+        method = self._selected_ball_method()
+        self.stereo_tracking.set_ball_detection_method(method)
+        self.playback_cache.clear()
+        self._load_playback_caches()
+        self._reset_playback_tracking()
 
         self._show_frame_at(0)
         self._update_status()
+
+    def _display_stereo_frames(
+        self,
+        left_frame: np.ndarray,
+        right_frame: np.ndarray,
+        *,
+        frame_index: int,
+        left_previous: np.ndarray | None = None,
+        right_previous: np.ndarray | None = None,
+        left_next: np.ndarray | None = None,
+        right_next: np.ndarray | None = None,
+        left_mog2_warmup: list[np.ndarray] | None = None,
+        right_mog2_warmup: list[np.ndarray] | None = None,
+        left_warmup: list[np.ndarray] | None = None,
+        left_warmup_start_index: int | None = None,
+    ) -> None:
+        ball_method = self._selected_ball_method()
+        left_filtered, right_filtered = self.stereo_tracking.apply(
+            left_frame,
+            right_frame,
+            frame_index=frame_index,
+            main_warmup_frames=left_warmup,
+            main_warmup_start_index=left_warmup_start_index,
+            main_previous_frame=left_previous,
+            main_next_frame=left_next,
+            main_mog2_warmup_frames=left_mog2_warmup,
+            secondary_previous_frame=right_previous,
+            secondary_next_frame=right_next,
+            secondary_mog2_warmup_frames=right_mog2_warmup,
+            video_fps=self.fps,
+            cache=self.playback_cache,
+            ball_method=ball_method,
+            stereo_timeline=(
+                self.stereo_reader.timeline
+                if self.stereo_reader is not None
+                else None
+            ),
+        )
+        self.frame_photo = stereo_frame_to_photo(
+            left_filtered, right_filtered, self.panel_size
+        )
+        self.video_label.configure(image=self.frame_photo, text="")
 
     def _show_raw_stereo(
         self, left_frame: np.ndarray, right_frame: np.ndarray
@@ -641,6 +796,11 @@ class GameTrackerApp:
                         stream.writer = None
                 return
 
+            if YOLO_INFERENCES.is_file():
+                YOLO_INFERENCES.unlink()
+            if GRU_INFERENCES.is_file():
+                GRU_INFERENCES.unlink()
+
             for stream in self._streams():
                 stream.recorded_frame_count = 0
                 stream.recorded_timestamps = []
@@ -671,7 +831,7 @@ class GameTrackerApp:
                     stream.writer.release()
                     stream.writer = None
 
-            frame_count, extended_labels = self._equalize_stereo_recordings()
+            frame_count, timeline_detail = self._finalize_stereo_recording()
 
             for stream in self._streams():
                 stream.video_path = stream.default_video
@@ -682,12 +842,57 @@ class GameTrackerApp:
 
             saved = f"Saved {LEFT_VIDEO.name} and {RIGHT_VIDEO.name}"
             if frame_count > 0:
-                saved += f" ({frame_count} frames each"
-                if extended_labels:
-                    saved += f", extended {', '.join(extended_labels)}"
-                saved += ")"
+                saved += f" ({timeline_detail})"
             self.status_var.set(saved)
             self._open_process_dialog(fps=self.record_fps, frame_count=frame_count)
+
+    def _import_from_stereo_viewer(self) -> None:
+        if self.recording:
+            messagebox.showwarning(
+                "Recording in progress",
+                "Stop recording before importing from stereo viewer.",
+                parent=self.root,
+            )
+            return
+
+        if (
+            not STEREO_VIEWER_LEFT_VIDEO.is_file()
+            or not STEREO_VIEWER_RIGHT_VIDEO.is_file()
+        ):
+            messagebox.showerror(
+                "No stereo viewer recording",
+                "stereo_viewer/recordings/left.mp4 and right.mp4 were not found.\n"
+                "Record a stereo pair in stereo viewer first.",
+                parent=self.root,
+            )
+            return
+
+        if LEFT_VIDEO.is_file() or RIGHT_VIDEO.is_file():
+            if not messagebox.askyesno(
+                "Overwrite game tracker recordings?",
+                "This replaces game_tracker/recordings/left.mp4 and right.mp4 "
+                "with the current stereo viewer recordings.",
+                parent=self.root,
+            ):
+                return
+
+        self._release_capture()
+
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(STEREO_VIEWER_LEFT_VIDEO, LEFT_VIDEO)
+        shutil.copy2(STEREO_VIEWER_RIGHT_VIDEO, RIGHT_VIDEO)
+        if YOLO_INFERENCES.is_file():
+            YOLO_INFERENCES.unlink()
+        if GRU_INFERENCES.is_file():
+            GRU_INFERENCES.unlink()
+        stereo_timeline = stereo_timeline_path_for(STEREO_VIEWER_LEFT_VIDEO)
+        if stereo_timeline.is_file():
+            shutil.copy2(stereo_timeline, RECORDINGS_DIR / STEREO_TIMELINE_FILENAME)
+
+        self.left.video_path = LEFT_VIDEO
+        self.right.video_path = RIGHT_VIDEO
+        self.mode.set("playback")
+        self._enter_playback_mode()
 
     def _open_videos(self) -> None:
         left_path = filedialog.askopenfilename(
@@ -716,20 +921,59 @@ class GameTrackerApp:
         self._enter_playback_mode()
 
     def _show_frame_at(self, index: int) -> bool:
-        if self.left.cap is None or self.right.cap is None:
+        if self.stereo_reader is None:
             return False
 
         index = max(0, index)
         if self.frame_count > 0:
             index = min(index, self.frame_count - 1)
 
-        ok_left, left_frame = read_frame_at(self.left.cap, index)
-        ok_right, right_frame = read_frame_at(self.right.cap, index)
-        if not ok_left or left_frame is None or not ok_right or right_frame is None:
+        left_frame, right_frame = self.stereo_reader.read_at_master(index)
+        if left_frame is None or right_frame is None:
             return False
 
         self.frame_index = index
-        self._show_raw_stereo(left_frame, right_frame)
+        method = self._selected_ball_method()
+        left_warmup, left_warmup_start_index = gru_warmup_for_timeline_playback(
+            self.stereo_reader,
+            self.frame_index,
+            self.left.gru_stream_frame_index,
+            self.stereo_tracking.throw_buffer_size(),
+            self.playback_cache.main,
+        )
+        (
+            left_previous,
+            right_previous,
+            left_next,
+            right_next,
+            left_mog2_warmup,
+            right_mog2_warmup,
+        ) = stereo_timeline_ball_mask_inputs(
+            self.stereo_reader,
+            method,
+            self.frame_index,
+            self.left.mog2_stream_frame_index,
+            self.right.mog2_stream_frame_index,
+            self.playback_cache.main,
+            self.playback_cache.secondary,
+        )
+        self._display_stereo_frames(
+            left_frame,
+            right_frame,
+            frame_index=self.frame_index,
+            left_previous=left_previous,
+            right_previous=right_previous,
+            left_next=left_next,
+            right_next=right_next,
+            left_mog2_warmup=left_mog2_warmup,
+            right_mog2_warmup=right_mog2_warmup,
+            left_warmup=left_warmup,
+            left_warmup_start_index=left_warmup_start_index,
+        )
+        self.left.gru_stream_frame_index = self.frame_index
+        if uses_mog2_component(method):
+            self.left.mog2_stream_frame_index = self.frame_index
+            self.right.mog2_stream_frame_index = self.frame_index
         self._update_status()
         return True
 
@@ -737,10 +981,20 @@ class GameTrackerApp:
         total = self.frame_count if self.frame_count > 0 else "?"
         left_name = self.left.video_path.name if self.left.video_path else "?"
         right_name = self.right.video_path.name if self.right.video_path else "?"
-        time_s = self.frame_index / self.fps if self.fps else 0
+        if self.stereo_timeline is not None and self.stereo_timeline.master_count:
+            time_s = self.stereo_timeline.master_times[self.frame_index]
+        else:
+            time_s = self.frame_index / self.fps if self.fps else 0
+        hold_bits: list[str] = []
+        if self.stereo_timeline is not None:
+            if self.stereo_timeline.is_hold("left", self.frame_index):
+                hold_bits.append("left hold")
+            if self.stereo_timeline.is_hold("right", self.frame_index):
+                hold_bits.append("right hold")
+        hold_suffix = f" [{', '.join(hold_bits)}]" if hold_bits else ""
         self.status_var.set(
             f"{left_name} + {right_name} — frame {self.frame_index + 1} / {total} "
-            f"({time_s:.2f}s @ {self.fps:.1f} fps)"
+            f"({time_s:.2f}s @ {self.fps:.1f} fps){hold_suffix}"
         )
         self._update_status_extra()
 
@@ -841,7 +1095,10 @@ class GameTrackerApp:
             self.playing = False
             return
 
-        self.after_id = self.root.after(1, self._schedule_playback)
+        delay_ms = 33
+        if self.stereo_timeline is not None:
+            delay_ms = self.stereo_timeline.slot_duration_ms(self.frame_index)
+        self.after_id = self.root.after(delay_ms, self._schedule_playback)
 
     def _on_close(self) -> None:
         self._release_capture()

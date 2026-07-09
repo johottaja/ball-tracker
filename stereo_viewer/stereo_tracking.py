@@ -5,7 +5,7 @@ import numpy as np
 from framesync import FrameSyncEngine, draw_framesync_overlay
 from framesync.playback import prepare_framesync_for_frame, record_framesync_completion
 from throw_detection.inference import ThrowInference
-from trajectory_tracking import TrajectoryTracker
+from trajectory_tracking import Phase, TrajectoryTracker
 from trajectory_tracking.stereo import reconcile_stereo_trackers
 from trajectory_tracking.drawing import draw_trajectory_overlay
 from trajectory_tracking.speed import TorsoLengthBuffer, estimate_throw_speed_m_s
@@ -16,9 +16,12 @@ from video_viewer.filters import (
     _draw_missing_model_banner,
     _extract_torso_length_px,
     _extract_wrist_pos,
+    wrist_pos_from_frame,
 )
 from video_viewer.pose_overlay import apply_gru_throw_inference
 from video_viewer.stereo_ball_detection import detect_stereo_balls
+from video_viewer.stereo_playback import tracker_throw_label_during_left_hold
+from video_viewer.stereo_timeline import StereoTimeline
 
 
 class StereoTrackingProcessor:
@@ -27,13 +30,14 @@ class StereoTrackingProcessor:
     Secondary camera: ball trajectory only, driven by the main throw label.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, enable_framesync: bool = True) -> None:
+        self._enable_framesync = enable_framesync
         self._throw_inference: ThrowInference | None = None
         self._main_tracker = TrajectoryTracker()
         self._secondary_tracker = TrajectoryTracker()
         self._main_motion = MotionMaskBuilder()
         self._secondary_motion = MotionMaskBuilder()
-        self._framesync_engine = FrameSyncEngine()
+        self._framesync_engine = FrameSyncEngine() if enable_framesync else None
         self._torso_length_buffer = TorsoLengthBuffer()
         self._main_completed_speed_m_s: float | None = None
         self._secondary_completed_speed_m_s: float | None = None
@@ -43,6 +47,8 @@ class StereoTrackingProcessor:
 
     @property
     def framesync_offset(self) -> float | None:
+        if self._framesync_engine is None:
+            return None
         return self._framesync_engine.latest_offset
 
     def set_ball_detection_method(self, method: BallDetectionMethod) -> None:
@@ -56,7 +62,8 @@ class StereoTrackingProcessor:
         self._secondary_tracker.reset()
         self._main_motion.reset()
         self._secondary_motion.reset()
-        self._framesync_engine.reset()
+        if self._framesync_engine is not None:
+            self._framesync_engine.reset()
         self._torso_length_buffer.reset()
         self._main_completed_speed_m_s = None
         self._secondary_completed_speed_m_s = None
@@ -114,6 +121,7 @@ class StereoTrackingProcessor:
         video_fps: float | None = None,
         cache: object | None = None,
         ball_method: object | None = None,
+        stereo_timeline: StereoTimeline | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         if (
             cache is not None
@@ -134,7 +142,8 @@ class StereoTrackingProcessor:
             self._secondary_tracker.reset()
             self._main_motion.reset()
             self._secondary_motion.reset()
-            self._framesync_engine.reset()
+            if self._framesync_engine is not None:
+                self._framesync_engine.reset()
             self._torso_length_buffer.reset()
             self._main_completed_speed_m_s = None
             self._secondary_completed_speed_m_s = None
@@ -142,7 +151,7 @@ class StereoTrackingProcessor:
             self._secondary_last_completion_id = 0
             self._last_frame_index = None
 
-        if frame_index is not None:
+        if self._enable_framesync and frame_index is not None:
             self._last_frame_index = prepare_framesync_for_frame(
                 self._framesync_engine,
                 frame_index,
@@ -166,9 +175,9 @@ class StereoTrackingProcessor:
             frame_index=frame_index,
         )
 
-        sync_id_before = self._framesync_engine.sync_id
         framesync_result = None
-        if frame_index is not None:
+        if self._enable_framesync and frame_index is not None:
+            sync_id_before = self._framesync_engine.sync_id
             framesync_result = self._framesync_engine.update(
                 frame_index,
                 detection.main.ball_bottom,
@@ -192,16 +201,19 @@ class StereoTrackingProcessor:
                     frame_index=frame_index,
                 )
             )
-            main_output = self._apply_framesync_overlay(
-                main_output,
-                framesync_result,
-                is_main=True,
-            )
-            secondary_output = self._apply_framesync_overlay(
-                secondary_frame.copy(),
-                framesync_result,
-                is_main=False,
-            )
+            if self._enable_framesync:
+                main_output = self._apply_framesync_overlay(
+                    main_output,
+                    framesync_result,
+                    is_main=True,
+                )
+                secondary_output = self._apply_framesync_overlay(
+                    secondary_frame.copy(),
+                    framesync_result,
+                    is_main=False,
+                )
+            else:
+                secondary_output = secondary_frame.copy()
             if (
                 cache is not None
                 and frame_index is not None
@@ -224,11 +236,25 @@ class StereoTrackingProcessor:
             frame_index=frame_index,
         )
         self._torso_length_buffer.add(_extract_torso_length_px(prediction.detection))
-        throw_label = prediction.label
+        throw_label = tracker_throw_label_during_left_hold(
+            prediction.label,
+            timeline=stereo_timeline,
+            master_index=frame_index,
+            cache=cache.main if cache is not None else None,
+        )
+
+        main_wrist_pos = _extract_wrist_pos(prediction.detection)
+        secondary_wrist_pos: tuple[int, int] | None = None
+        if throw_label == 1 or self._secondary_tracker.phase == Phase.SCANNING_BALL:
+            secondary_wrist_pos = wrist_pos_from_frame(
+                secondary_frame,
+                cache=cache.secondary if cache is not None else None,
+                frame_index=frame_index,
+            )
 
         main_result = self._main_tracker.update(
             throw_label=throw_label,
-            wrist_pos=_extract_wrist_pos(prediction.detection),
+            wrist_pos=main_wrist_pos,
             motion_mask=detection.main.motion_mask,
             alternate_motion_mask=detection.main.alternate_motion_mask,
             defer_detecting_throw=True,
@@ -236,6 +262,7 @@ class StereoTrackingProcessor:
         )
         secondary_result = self._secondary_tracker.update_secondary(
             throw_label=throw_label,
+            wrist_pos=secondary_wrist_pos,
             motion_mask=detection.secondary.motion_mask,
             alternate_motion_mask=detection.secondary.alternate_motion_mask,
             defer_detecting_throw=True,
@@ -245,7 +272,8 @@ class StereoTrackingProcessor:
             self._main_tracker,
             self._secondary_tracker,
             throw_label=throw_label,
-            wrist_pos=_extract_wrist_pos(prediction.detection),
+            wrist_pos=main_wrist_pos,
+            secondary_wrist_pos=secondary_wrist_pos,
         )
 
         if main_result.completion_id != self._main_last_completion_id:
@@ -291,11 +319,12 @@ class StereoTrackingProcessor:
             speed_m_s=self._main_completed_speed_m_s,
             large_phase_label=True,
         )
-        main_output = self._apply_framesync_overlay(
-            main_output,
-            framesync_result,
-            is_main=True,
-        )
+        if self._enable_framesync:
+            main_output = self._apply_framesync_overlay(
+                main_output,
+                framesync_result,
+                is_main=True,
+            )
         secondary_output = draw_trajectory_overlay(
             secondary_frame,
             secondary_result,
@@ -304,11 +333,12 @@ class StereoTrackingProcessor:
             speed_m_s=self._secondary_completed_speed_m_s,
             large_phase_label=True,
         )
-        secondary_output = self._apply_framesync_overlay(
-            secondary_output,
-            framesync_result,
-            is_main=False,
-        )
+        if self._enable_framesync:
+            secondary_output = self._apply_framesync_overlay(
+                secondary_output,
+                framesync_result,
+                is_main=False,
+            )
         if (
             cache is not None
             and frame_index is not None

@@ -74,8 +74,10 @@ class TableCalibrationDialog:
         ttk.Label(
             root,
             text=(
-                "Click all four table corners on each camera feed (any order). "
-                "Use the Reset button to start over on a panel."
+                "Click four table corners on each feed in the same order (clockwise from "
+                "above): 1 (+length,+width), 2 (+length,−width), 3 (−length,−width), "
+                "4 (−length,+width). Origin is table center; length = +X, width = +Y. "
+                "Use Reset to start over."
             ),
             wraplength=self._panel_size[0] * 2 - 24,
             justify=tk.LEFT,
@@ -98,6 +100,26 @@ class TableCalibrationDialog:
         ttk.Label(dims, text="Table width (m):").pack(side=tk.LEFT)
         self._width_var = tk.StringVar(value=self._default_width)
         ttk.Entry(dims, textvariable=self._width_var, width=10).pack(side=tk.LEFT, padx=(4, 0))
+
+        focal_row = ttk.Frame(root)
+        focal_row.pack(fill=tk.X, pady=(8, 0))
+        self._match_right_focal_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            focal_row,
+            text="Right camera: use left focal length (for cropped/zoomed feeds)",
+            variable=self._match_right_focal_var,
+        ).pack(anchor=tk.W)
+
+        hfov_row = ttk.Frame(root)
+        hfov_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(hfov_row, text="Right horizontal FOV (°), optional:").pack(side=tk.LEFT)
+        self._right_hfov_var = tk.StringVar(value="")
+        ttk.Entry(hfov_row, textvariable=self._right_hfov_var, width=8).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Label(
+            hfov_row,
+            text="overrides the checkbox when set",
+            foreground="#666666",
+        ).pack(side=tk.LEFT, padx=(8, 0))
 
         btn_row = ttk.Frame(root)
         btn_row.pack(fill=tk.X, pady=(12, 0))
@@ -237,6 +259,26 @@ class TableCalibrationDialog:
             return
 
         image_height, image_width = self._left_base.shape[:2]
+        right_hfov_text = self._right_hfov_var.get().strip()
+        right_horizontal_fov_deg: float | None = None
+        if right_hfov_text:
+            try:
+                right_horizontal_fov_deg = float(right_hfov_text)
+            except ValueError:
+                messagebox.showerror(
+                    "Invalid input",
+                    "Right horizontal FOV must be numeric when provided.",
+                    parent=self._window,
+                )
+                return
+            if right_horizontal_fov_deg <= 0.0 or right_horizontal_fov_deg >= 179.0:
+                messagebox.showerror(
+                    "Invalid input",
+                    "Right horizontal FOV must be between 0° and 179°.",
+                    parent=self._window,
+                )
+                return
+
         try:
             calibration = build_table_calibration(
                 length_m=length_m,
@@ -245,6 +287,8 @@ class TableCalibrationDialog:
                 image_height=image_height,
                 left_corners=[(float(x), float(y)) for x, y in self._left_corners],
                 right_corners=[(float(x), float(y)) for x, y in self._right_corners],
+                match_right_focal_to_left=self._match_right_focal_var.get(),
+                right_horizontal_fov_deg=right_horizontal_fov_deg,
             )
         except ValueError as exc:
             messagebox.showerror("Calibration failed", str(exc), parent=self._window)

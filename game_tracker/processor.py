@@ -6,8 +6,6 @@ from typing import Callable
 
 import numpy as np
 
-from framesync import FrameSyncEngine
-from framesync.playback import prepare_framesync_for_frame, record_framesync_completion
 from throw_detection.inference import ThrowInference
 from trajectory_tracking import Phase, TrajectoryTracker
 from trajectory_tracking.stereo import reconcile_stereo_trackers
@@ -17,14 +15,16 @@ from trajectory_tracking.release import (
 )
 from video_viewer.ball_motion import BallDetectionMethod, MotionMaskBuilder
 from video_viewer.config import THROW_MODEL_PATH
-from video_viewer.filters import _extract_wrist_pos
+from video_viewer.filters import _extract_wrist_pos, wrist_pos_from_frame
 from video_viewer.stereo_ball_detection import detect_stereo_balls
+from video_viewer.stereo_playback import tracker_throw_label_during_left_hold
+from video_viewer.stereo_timeline import StereoTimeline
 
 from calibration import TableCalibration
 
 from .config import GAME_JSON
 from .game_data import GameSession, Point2D, ThrowRecord, new_game_session, save_game
-from .triangulation import triangulate_throw
+from .triangulation import TriangulationResult, triangulate_throw
 
 
 @dataclass
@@ -42,8 +42,8 @@ class GameTrackingProcessor:
         self._secondary_tracker = TrajectoryTracker()
         self._main_motion = MotionMaskBuilder()
         self._secondary_motion = MotionMaskBuilder()
-        self._framesync_engine = FrameSyncEngine()
         self._calibration: TableCalibration | None = None
+        self._stereo_timeline: StereoTimeline | None = None
         self._session: GameSession | None = None
         self._game_json_path = GAME_JSON
         self._on_throw_recorded: Callable[[ThrowRecord], None] | None = None
@@ -57,17 +57,15 @@ class GameTrackingProcessor:
         self._next_throw_id = 1
         self._frame_size: tuple[int, int] | None = None
         self._fps: float = 30.0
-        self._last_frame_index: int | None = None
         self._auto_persist = True
 
         self.state = ProcessorState()
 
-    @property
-    def framesync_offset(self) -> float | None:
-        return self._framesync_engine.latest_offset
-
     def set_calibration(self, calibration: TableCalibration | None) -> None:
         self._calibration = calibration
+
+    def set_stereo_timeline(self, timeline: StereoTimeline | None) -> None:
+        self._stereo_timeline = timeline
 
     def set_on_throw_recorded(self, callback: Callable[[ThrowRecord], None] | None) -> None:
         self._on_throw_recorded = callback
@@ -102,6 +100,7 @@ class GameTrackingProcessor:
         self._session = new_game_session(
             fps=fps,
             frame_count=frame_count,
+            calibration=self._calibration,
         )
         self._next_throw_id = 1
         self.state = ProcessorState()
@@ -125,18 +124,17 @@ class GameTrackingProcessor:
         self._secondary_tracker.reset()
         self._main_motion.reset()
         self._secondary_motion.reset()
-        self._framesync_engine.reset()
         self._main_pending = []
         self._secondary_pending = []
         self._last_paired_main_completion_id = 0
         self._last_paired_secondary_completion_id = 0
         self._main_phase_prev = Phase.DETECTING_THROW
         self._secondary_phase_prev = Phase.DETECTING_THROW
-        self._last_frame_index = None
 
     def reset(self) -> None:
         self.reset_tracking()
         self._session = None
+        self._stereo_timeline = None
         self.state = ProcessorState()
 
     def _ensure_throw_inference(self) -> ThrowInference | None:
@@ -165,6 +163,31 @@ class GameTrackingProcessor:
         if phase == Phase.TRACKING_BALL and detected_pos is not None:
             pending.append(Point2D(frame=frame_index, x=detected_pos[0], y=detected_pos[1]))
 
+    def _log_triangulation_result(
+        self,
+        result: TriangulationResult,
+        *,
+        main_completion_id: int,
+        secondary_completion_id: int,
+    ) -> None:
+        if result.ok and result.throw is not None:
+            throw = result.throw
+            speed = throw.speed_m_s
+            speed_text = f"{speed:.2f} m/s" if speed is not None else "unknown speed"
+            print(
+                "Triangulated throw "
+                f"{throw.id}: frames {throw.start_frame}-{throw.end_frame}, "
+                f"{len(throw.points_3d)} 3D points, {speed_text}"
+            )
+            return
+
+        print(
+            "Triangulation failed "
+            f"(left completion {main_completion_id}, "
+            f"right completion {secondary_completion_id}): "
+            f"{result.error or 'unknown error'}"
+        )
+
     def _try_pair_throw(self, cache: object | None = None) -> None:
         main_id = self._main_tracker._completion_id
         secondary_id = self._secondary_tracker._completion_id
@@ -182,9 +205,12 @@ class GameTrackingProcessor:
         self._secondary_pending = []
 
         if self._frame_size is None:
+            print(
+                "Triangulation failed "
+                f"(left completion {main_id}, right completion {secondary_id}): "
+                "frame size not set"
+            )
             return
-
-        frame_offset = self._framesync_engine.latest_offset
 
         if cache is not None:
             release = find_release_point_from_cache(
@@ -201,7 +227,7 @@ class GameTrackingProcessor:
                     right_track,
                     self._secondary_tracker._completed_parabola_fit,
                     release.frame,
-                    timeline_offset=frame_offset or 0.0,
+                    timeline_offset=0.0,
                 )
                 if secondary_release is not None:
                     right_track = [
@@ -213,18 +239,24 @@ class GameTrackingProcessor:
                         *right_track,
                     ]
 
-        throw = triangulate_throw(
+        result = triangulate_throw(
             left_track,
             right_track,
             calibration=self._calibration,
             frame_size=self._frame_size,
             fps=self._fps,
             throw_id=self._next_throw_id,
-            frame_offset=frame_offset,
+            timeline=self._stereo_timeline,
         )
-        if throw is None:
+        self._log_triangulation_result(
+            result,
+            main_completion_id=main_id,
+            secondary_completion_id=secondary_id,
+        )
+        if not result.ok or result.throw is None:
             return
 
+        throw = result.throw
         self._next_throw_id += 1
         if self._session is not None:
             self._session.throws = self._session.throws or []
@@ -266,13 +298,6 @@ class GameTrackingProcessor:
         if main_warmup_frames is not None:
             self.reset_tracking()
 
-        self._last_frame_index = prepare_framesync_for_frame(
-            self._framesync_engine,
-            frame_index,
-            self._last_frame_index,
-            cache,
-        )
-
         detection = detect_stereo_balls(
             self._main_motion,
             self._secondary_motion,
@@ -289,20 +314,6 @@ class GameTrackingProcessor:
             frame_index=frame_index,
         )
 
-        sync_id_before = self._framesync_engine.sync_id
-        self._framesync_engine.update(
-            frame_index,
-            detection.main.ball_bottom,
-            detection.secondary.ball_bottom,
-            video_fps=video_fps,
-        )
-        record_framesync_completion(
-            self._framesync_engine,
-            frame_index,
-            sync_id_before,
-            cache,
-        )
-
         inference = self._ensure_throw_inference()
         if inference is None:
             return main_frame.copy(), secondary_frame.copy()
@@ -314,11 +325,25 @@ class GameTrackingProcessor:
             cache=cache.main if cache is not None else None,
             frame_index=frame_index,
         )
-        throw_label = prediction.label
+        throw_label = tracker_throw_label_during_left_hold(
+            prediction.label,
+            timeline=self._stereo_timeline,
+            master_index=frame_index,
+            cache=cache.main if cache is not None else None,
+        )
+
+        main_wrist_pos = _extract_wrist_pos(prediction.detection)
+        secondary_wrist_pos: tuple[int, int] | None = None
+        if throw_label == 1 or self._secondary_tracker.phase == Phase.SCANNING_BALL:
+            secondary_wrist_pos = wrist_pos_from_frame(
+                secondary_frame,
+                cache=cache.secondary if cache is not None else None,
+                frame_index=frame_index,
+            )
 
         main_result = self._main_tracker.update(
             throw_label=throw_label,
-            wrist_pos=_extract_wrist_pos(prediction.detection),
+            wrist_pos=main_wrist_pos,
             motion_mask=detection.main.motion_mask,
             alternate_motion_mask=detection.main.alternate_motion_mask,
             defer_detecting_throw=True,
@@ -326,6 +351,7 @@ class GameTrackingProcessor:
         )
         secondary_result = self._secondary_tracker.update_secondary(
             throw_label=throw_label,
+            wrist_pos=secondary_wrist_pos,
             motion_mask=detection.secondary.motion_mask,
             alternate_motion_mask=detection.secondary.alternate_motion_mask,
             defer_detecting_throw=True,
@@ -335,7 +361,8 @@ class GameTrackingProcessor:
             self._main_tracker,
             self._secondary_tracker,
             throw_label=throw_label,
-            wrist_pos=_extract_wrist_pos(prediction.detection),
+            wrist_pos=main_wrist_pos,
+            secondary_wrist_pos=secondary_wrist_pos,
         )
         if main_reconciled:
             self._main_pending = []

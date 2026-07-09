@@ -11,14 +11,14 @@ Guidance for AI agents working in this repository.
 **Current state:** Six Python desktop apps plus shared detection libraries:
 
 - **`video_viewer/`** — record webcam video and inspect it frame by frame. Includes configurable **ball detection** (MOG2 + morphological closing, or frame diff → threshold) with contour/circularity filtering, plus **throw detection** (YOLOv11 pose overlay via `pose_detection`).
-- **`stereo_viewer/`** — dual-camera version of the video viewer: side-by-side live preview and playback, same filter set applied independently per camera (plus **Stereo tracking** and **Frame sync**, stereo-only). Records `left.mp4` and `right.mp4` under `stereo_viewer/recordings/`; on stop, the shorter clip is re-encoded to match the longer clip's frame count, duplicating frames at capture times where that camera fell behind (per-frame `time.monotonic()` timestamps; the longer clip is left unchanged).
-- **`game_tracker/`** — production dual-camera app for recording a full beer pong game. No debug filters; always runs stereo throw + ball tracking, triangulates 3D trajectories from configurable camera geometry, and saves throws to `game_tracker/recordings/game.json` for a future React SPA. Records `left.mp4` / `right.mp4` under `game_tracker/recordings/` with the same timestamp-based frame extension on stop as `stereo_viewer`.
+- **`stereo_viewer/`** — dual-camera version of the video viewer: side-by-side live preview and playback, same filter set applied independently per camera (plus **Stereo tracking** and **Frame sync**, stereo-only). Records `left.mp4` and `right.mp4` under `stereo_viewer/recordings/`; on stop saves per-camera capture timestamps to `stereo_timeline.json` and aligns playback on a shared master timeline (no video re-encode). Playback **Preprocess** runs batched YOLO pose inference then batched GRU throw inference (`yolo_inferences.npz`, `gru_inferences.npz`).
+- **`game_tracker/`** — production dual-camera app for recording a full beer pong game. No debug filters; always runs stereo throw + ball tracking, triangulates 3D trajectories from configurable camera geometry, and saves throws to `game_tracker/games/*.json` for a future React SPA. Records native `left.mp4` / `right.mp4` under `game_tracker/recordings/` plus `stereo_timeline.json` for time-domain stereo alignment (same module as `stereo_viewer`).
 - **`pose_detection/`** — reusable YOLO pose pipeline: per-frame dominant-hand selection and batch extraction of arm keypoints from frame sequences.
 - **`training_recorder/`** — lightweight GUI for recording labeled training clips. Enter a training set name; each clip is saved under `recordings/<training_set>/` at the repo root (separate from `video_viewer/recordings/`).
 - **`throw_detection/`** — throw-event labeling GUI, GRU training-data export, GRU training GUI, and streaming GRU inference. Labels per-frame throw/not-throw on clips from `recordings/<set>/`; saves NumPy `.npz` datasets under `throw_detection/training_sets/`; trained models under `throw_detection/models/`.
 - **`trajectory_tracking/`** — stateful ball trajectory tracker that combines throw inference with configurable ball motion masks. Three phases: detecting throw → scanning for ball in a circular sector from the wrist → tracking ball frame-by-frame. Fits a parabola to the collected positions and exposes drawing helpers for the video viewer filter.
 - **`framesync/`** — stereo camera frame-offset measurement from deliberate straight-down ball drops and table bounces. Per-camera macro phase machine plus subframe bounce-time estimation; reused by the stereo viewer **Frame sync** filter.
-- **`calibration/`** — shared table-corner calibration UI and homography math. **Calibrate** in `stereo_viewer` and `game_tracker` saves `calibration.json` at the repo root (gitignored): table dimensions, calibration frame size, and per-camera 3×4 projection matrices (computed from corner clicks at save time). `game_tracker` triangulates 3D throws directly from the saved projection matrices via `cv2.triangulatePoints`.
+- **`calibration/`** — shared table-corner calibration UI and homography math. **Calibrate** in `stereo_viewer` and `game_tracker` saves `calibration.json` at the repo root (gitignored): table dimensions, calibration frame size, per-camera 3×4 projection matrices (computed from corner clicks at save time), and persisted camera layout stats (positions, angles, FOVs, stereo baseline). The dialog can pin the right camera’s focal length to the left (for digitally cropped/zoomed feeds such as a vertical iPhone forced into 16:9) or accept an explicit right horizontal FOV. `game_tracker` triangulates 3D throws directly from the saved projection matrices via `cv2.triangulatePoints`; **Camera layout** reads the saved layout stats.
 
 Dual-camera synchronized recording is available via `stereo_viewer` and `game_tracker`. Stereo 3D triangulation and JSON export are implemented in `game_tracker`; a React 3D map UI is not built yet.
 
@@ -127,9 +127,11 @@ balltracker/
 ├── calibration/              # Table-corner calibration UI + homography storage
 │   ├── __init__.py
 │   ├── config.py             # CALIBRATION_JSON path
-│   ├── types.py              # TableCalibration, CameraCalibration
+│   ├── types.py              # TableCalibration, CameraCalibration, layout stats types
 │   ├── homography.py         # corner→H, H→projection matrix, triangulation helpers
-│   ├── storage.py            # load/save calibration.json
+│   ├── layout.py             # camera layout stats from projection matrices
+│   ├── layout_dialog.py      # Camera layout top-down visualization
+│   ├── storage.py            # load/save calibration.json (+ layout attach/migrate)
 │   ├── dialog.py             # TableCalibrationDialog
 │   └── frames.py             # capture_stereo_pair from record/playback state
 └── video_viewer/             # Viewer and CV debugging app
@@ -149,6 +151,9 @@ balltracker/
     ├── ball_detection.py     # Contour/circularity logic and ball overlays
     ├── stereo_ball_detection.py # Shared stereo mask + full-frame ball-bottom detection
     ├── pose_overlay.py       # Dominant-hand skeleton overlay for the viewer filter
+    ├── yolo_batch.py         # Batched YOLO pose inference + npz cache
+    ├── gru_batch.py          # Batched GRU throw inference from pose cache + npz cache
+    ├── pose_estimation.py    # Playback Preprocess panel (YOLO ± GRU)
     └── recordings/           # Viewer default save dir (gitignored)
 ```
 
@@ -173,7 +178,7 @@ balltracker/
 | `stereo_viewer/stereo_tracking.py` | `StereoTrackingProcessor` — main GRU + ball track on both cameras; secondary ball-only track |
 | `stereo_viewer/frame_sync.py` | `FrameSyncProcessor` — ball drop/bounce sync on both cameras via `FrameSyncEngine` |
 | **game_tracker** | |
-| `game_tracker/app.py` | `GameTrackerApp` — dual-camera record/playback, ball-detection method, table calibration; always-on `GameTrackingProcessor` |
+| `game_tracker/app.py` | `GameTrackerApp` — dual-camera record/playback, ball-detection method, table calibration; **Import from stereo viewer** copies `stereo_viewer/recordings/left.mp4` and `right.mp4` into game tracker recordings |
 | `game_tracker/config.py` | `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `GAME_JSON` |
 | `game_tracker/processor.py` | `GameTrackingProcessor` — stereo GRU + ball tracking, frame-indexed 2D capture, triangulation, incremental `game.json` writes |
 | `game_tracker/triangulation.py` | `cv2.triangulatePoints` from calibration projection matrices; quadratic 3D curve fit; speed from 3D arc length |
@@ -189,7 +194,9 @@ balltracker/
 | `ball_motion.py` | `BallDetectionMethod`, `MotionMaskBuilder` — MOG2, frame diff, hybrid, and hybrid-stacked masks |
 | `ball_detection.py` | Circular contour filtering, largest-ball selection, `contour_bottom_center`, drawing |
 | `pose_overlay.py` | Throw / normalized-throw / GRU-inference filter overlays (imports `pose_detection`, `throw_detection.inference`) |
-| `recording.py` | Create MP4 writer; `extend_video_to_reference` re-encodes the lagging clip with duplicates where it fell behind; `extend_video_evenly` is the no-timestamp fallback |
+| `recording.py` | Create MP4 writer; legacy `extend_video_to_reference` / `extend_video_evenly` helpers (no longer used by stereo apps) |
+| `stereo_timeline.py` | `StereoTimeline` — master playback slots from per-camera `time.monotonic()` capture timestamps; save/load `stereo_timeline.json` |
+| `stereo_playback.py` | `StereoFrameReader` — read native source frames through master timeline; native ±1 neighbors for frame diff on hold slots |
 | `display.py` | Fit frames to max display size, convert to `PhotoImage` |
 | **throw_detection** | |
 | `config.py` | `BUFFER_SIZE` (GRU rolling window), `TRAINING_SETS_DIR`, `MODELS_DIR` |
@@ -291,7 +298,7 @@ A new throw label while in phase 3 immediately finalises the current trajectory 
 - Phase label text in the top-left corner.
 - After a throw is fully tracked: speed readout in the top-right (`X.X m/s  Y.Y km/h`), inferred from fitted curve length × torso scale (50 cm assumed shoulder→hip, 10-frame rolling mean) ÷ tracking frame count at the video file's FPS (playback mode only).
 
-**Stereo viewer (`FilterId.STEREO_TRACKING`, stereo viewer only):** left (main) camera runs GRU throw inference (pose skeleton, logit, label badge) plus wrist-anchored ball tracking. The right (secondary) camera runs ball tracking only, driven by the main throw label (full-frame scan, then sector follow). Both panels show trajectory overlays plus framesync overlay (phase label, ±offset badge). Ball motion masks and full-frame ball-bottom detection are shared with the framesync engine via `video_viewer.stereo_ball_detection` (no duplicate mask work). Throw detection is not run on the secondary camera. Trajectories with fewer than `MIN_TRAJECTORY_POINTS` detected positions are discarded so brief GRU flickers do not replace a completed throw. A failed camera (discarded trajectory or scan timeout) immediately adopts the partner's phase instead of blocking in `awaiting_partner`. Valid completions wait in `awaiting_partner` until the partner also completes or `AWAITING_PARTNER_TIMEOUT_FRAMES` elapses; when both are awaiting on the same frame, both return to `detecting_throw` immediately.
+**Stereo viewer (`FilterId.STEREO_TRACKING`, stereo viewer only):** left (main) camera runs GRU throw inference (pose skeleton, logit, label badge) plus wrist-anchored ball tracking. The right (secondary) camera runs ball tracking only, driven by the main throw label; during **scanning ball** it uses right-camera YOLO pose (from preprocess cache or live inference) to search the same wrist-anchored sector as the main feed, falling back to full-frame scan when pose is missing. Both panels show trajectory overlays plus framesync overlay (phase label, ±offset badge). Ball motion masks and full-frame ball-bottom detection are shared with the framesync engine via `video_viewer.stereo_ball_detection` (no duplicate mask work). GRU throw detection is not run on the secondary camera. Trajectories with fewer than `MIN_TRAJECTORY_POINTS` detected positions are discarded so brief GRU flickers do not replace a completed throw. A failed camera (discarded trajectory or scan timeout) immediately adopts the partner's phase instead of blocking in `awaiting_partner`. Valid completions wait in `awaiting_partner` until the partner also completes or `AWAITING_PARTNER_TIMEOUT_FRAMES` elapses; when both are awaiting on the same frame, both return to `detecting_throw` immediately.
 
 Tune via `trajectory_tracking/config.py`: `SECTOR_ANGLE_DEG`, `SECTOR_DIRECTION_DEG`, `SECTOR_RADIUS_PX`, `TRACKING_TIMEOUT_FRAMES`, `MIN_TRAJECTORY_POINTS`, `BALL_CIRCULARITY_MIN/MAX`, `ASSUMED_TORSO_CM`, `TORSO_LENGTH_BUFFER_SIZE`.
 
@@ -299,15 +306,19 @@ Tune via `trajectory_tracking/config.py`: `SECTOR_ANGLE_DEG`, `SECTOR_DIRECTION_
 
 Production app for recording a beer pong session and exporting 3D throw trajectories to JSON.
 
-**UI:** Same record/playback/camera-selection shell as `stereo_viewer`, but **no display filters**. Ball detection method combobox only (MOG2 + closing, frame diff, hybrid, or hybrid stacked). **Calibrate** opens the shared table-corner calibration dialog (saves `calibration.json` at repo root).
+**UI:** Same record/playback/camera-selection shell as `stereo_viewer`, but **no display filters**. Ball detection method combobox on playback only (MOG2 + closing, frame diff, hybrid, or hybrid stacked). **Calibrate** opens the shared table-corner calibration dialog (saves `calibration.json` at repo root).
 
-**Recording:** Raw frames to `game_tracker/recordings/left.mp4` and `right.mp4`. On stop, the shorter clip is extended to match the longer using capture timestamps (`extend_video_to_reference`; same procedure as `stereo_viewer`). Fresh `game.json` session header written on stop.
+**Playback overlays:** Same stereo tracking visualization as `stereo_viewer` **Stereo tracking** (left: GRU pose + logit + label badge + trajectory overlay; right: trajectory overlay only) — no framesync. Loads `yolo_inferences.npz` / `gru_inferences.npz` from `game_tracker/recordings/` into `PlaybackCache` when present (written by **Process game…**).
 
-**Tracking (`GameTrackingProcessor`):** Active during playback (live record shows raw frames). Main (left) camera: GRU throw inference + wrist-anchored ball tracking. Secondary (right): ball tracking driven by main throw label. Stereo phase gate (`AWAITING_PARTNER`) pairs valid completions across cameras; failed tracks adopt the partner phase via `trajectory_tracking.stereo.reconcile_stereo_trackers`. Shared stereo ball detection (`video_viewer.stereo_ball_detection`) feeds both trajectory tracking and an embedded `FrameSyncEngine`. Frame-indexed 2D detections captured during `TRACKING_BALL`; when both cameras complete a throw, `triangulate_throw` pairs left/right points using the measured framesync offset (linear interpolation on the secondary track) and `calibration.json` homographies.
+**Recording:** Raw frames to `game_tracker/recordings/left.mp4` and `right.mp4` at native frame counts. On stop, per-camera capture timestamps are saved to `stereo_timeline.json`; master timeline length equals the longer clip. Playback and batch processing read aligned frames through `StereoFrameReader` (holds on the lagging side only — no duplicate frames baked into MP4s).
+
+**Offline processing (`batch_process.process_game_recording`):** three phases — batched YOLO pose (`yolo_inferences.npz`), batched GRU throw labels on the main camera from pose features (`gru_inferences.npz`, keyed to the active `.pt` model), then ball/trajectory tracking with both caches loaded into `PlaybackCache`.
+
+**Tracking (`GameTrackingProcessor`):** Active during batch processing after record. Main (left) camera: GRU throw inference + wrist-anchored ball tracking. Secondary (right): ball tracking driven by main throw label, with wrist-anchored sector scan on the right feed during **scanning ball** (right YOLO from preprocess cache or live inference; full-frame fallback when pose is missing). Stereo phase gate (`AWAITING_PARTNER`) pairs valid completions across cameras; failed tracks adopt the partner phase via `trajectory_tracking.stereo.reconcile_stereo_trackers`. Frame-indexed 2D detections captured during `TRACKING_BALL` on the master timeline; when both cameras complete a throw, `triangulate_throw` pairs left/right by master capture time from `stereo_timeline.json` (linear interpolation on the secondary track). Speed uses actual slot durations from the timeline, not nominal FPS.
 
 **3D coordinate system:** Origin at table center; X along table length, Y along width, Z up from table (meters). **Calibrate** saves 3×4 projection matrices per camera (derived from corner clicks + focal-length estimation at save time). Per-point triangulation via `cv2.triangulatePoints` on temporally aligned 2D pairs (`secondary_frame = main_frame + offset` when offset is known). Video frame size must match the calibration frame size. 3D speed from fitted curve arc length ÷ throw duration. Requires `calibration.json` at repo root (saved via **Calibrate**).
 
-**`game.json` schema (version 1):** `recorded_at`, `fps`, `frame_count`, `videos`, `coordinate_system`, `throws[]` with `id`, `start_frame`, `end_frame`, `points_3d`, `fitted_curve_3d`, `speed_m_s`, `tracks_2d` (left/right pixel tracks). Designed for consumption by a future React SPA.
+**`game.json` schema (version 1):** `recorded_at`, `fps`, `frame_count`, `videos`, `coordinate_system`, optional `calibration` (full `calibration.json` snapshot including `layout` stats, written at process time), `throws[]` with `id`, `start_frame`, `end_frame`, `points_3d`, `fitted_curve_3d`, `speed_m_s`, `tracks_2d` (left/right pixel tracks). Designed for consumption by a future React SPA.
 
 ## Frame sync (`framesync`)
 
@@ -345,7 +356,7 @@ Tune via `framesync/config.py`: `DROP_STREAK_FRAMES`, `MAX_HORIZONTAL_DELTA_PX`,
 **`game_tracker/config.py`**
 
 - **Paths:** `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `GAME_JSON`
-- **Triangulation:** `MAX_TRIANGULATION_HEIGHT_M`, `MAX_TRIANGULATION_RESIDUAL_M`
+- **Triangulation:** `MIN_TRIANGULATION_HEIGHT_M`, `MAX_TRIANGULATION_HEIGHT_M`, `MAX_TRIANGULATION_RESIDUAL_M`
 
 **`pose_detection/config.py`**
 
@@ -377,7 +388,7 @@ Tune via `framesync/config.py`: `DROP_STREAK_FRAMES`, `MAX_HORIZONTAL_DELTA_PX`,
 
 - **Paths:** `CALIBRATION_JSON` (repo root `calibration.json`, gitignored)
 
-**`calibration.json` schema:** `table_length_m`, `table_width_m`, `image_width`, `image_height`, `cameras[]` with `name` (`left` / `right`) and `projection_matrix` (3×4 nested list, world XYZ → image pixels). Corner clicks may be in any order; on save, each quadrilateral is auto-matched to world corners `(+L/2,+W/2)`, `(+L/2,−W/2)`, `(−L/2,−W/2)`, `(−L/2,+W/2)` via cyclic permutations and focal-length scoring.
+**`calibration.json` schema:** `table_length_m`, `table_width_m`, `image_width`, `image_height`, `cameras[]` with `name` (`left` / `right`) and `projection_matrix` (3×4 nested list, world XYZ → image pixels), and `layout` with per-camera stats (`center`, `xy_distance_m`, `z_m`, `yaw_deg`, `pitch_deg`, `horizontal_fov_deg`, `fov_left_xy`, `fov_right_xy`) plus optional `stereo` (`baseline_xy_m`, `baseline_3d_m`, `delta_z_m`). Layout stats are computed on save; legacy files without `layout` are auto-migrated on load. Corner clicks must be in canonical order (clockwise from above): `(+L/2,+W/2)`, `(+L/2,−W/2)`, `(−L/2,−W/2)`, `(−L/2,+W/2)`.
 
 **`framesync/config.py`**
 

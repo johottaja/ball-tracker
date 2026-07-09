@@ -1,16 +1,35 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from .config import CALIBRATION_JSON
+from .layout import compute_calibration_layout
 from .types import TableCalibration
+
+
+def attach_layout_stats(calibration: TableCalibration) -> TableCalibration:
+    layout = calibration.layout
+    needs_layout = (
+        layout is None
+        or not layout.cameras
+        or (
+            layout.stereo is None
+            and calibration.camera("left") is not None
+            and calibration.camera("right") is not None
+        )
+    )
+    if not needs_layout:
+        return calibration
+    return replace(calibration, layout=compute_calibration_layout(calibration))
 
 
 def save_calibration(
     calibration: TableCalibration,
     path: Path = CALIBRATION_JSON,
 ) -> None:
+    calibration = attach_layout_stats(calibration)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(
@@ -30,6 +49,9 @@ def load_calibration(path: Path = CALIBRATION_JSON) -> TableCalibration | None:
         calibration = TableCalibration.from_dict(data)
         if len(calibration.cameras) < 2:
             return None
+        if calibration.layout is None or not calibration.layout.cameras:
+            calibration = attach_layout_stats(calibration)
+            save_calibration(calibration, path)
         return calibration
     except (OSError, json.JSONDecodeError, TypeError, ValueError, KeyError):
         return None

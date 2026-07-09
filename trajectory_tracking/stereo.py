@@ -21,6 +21,7 @@ def reconcile_stereo_trackers(
     *,
     throw_label: int,
     wrist_pos: tuple[int, int] | None,
+    secondary_wrist_pos: tuple[int, int] | None = None,
 ) -> tuple[bool, bool]:
     """
     After per-camera updates, align cameras that failed a throw (discarded
@@ -45,7 +46,7 @@ def reconcile_stereo_trackers(
             main,
             is_secondary=True,
             throw_label=throw_label,
-            wrist_pos=wrist_pos,
+            wrist_pos=secondary_wrist_pos,
         )
         secondary_reconciled = True
 

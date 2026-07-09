@@ -487,6 +487,28 @@ def _extract_wrist_pos(detection: object) -> tuple[int, int] | None:
     return (int(wrist.x), int(wrist.y))
 
 
+def wrist_pos_from_frame(
+    frame: np.ndarray,
+    *,
+    cache: object | None = None,
+    frame_index: int | None = None,
+) -> tuple[int, int] | None:
+    """Dominant-hand wrist in frame pixels, using pose cache when available."""
+    if cache is not None and frame_index is not None:
+        from .playback_cache import cached_pose_detection
+
+        detection = cached_pose_detection(
+            frame,
+            cache=cache,
+            frame_index=frame_index,
+        )
+    else:
+        from pose_detection import detect_dominant_hand_detection
+
+        detection = detect_dominant_hand_detection(frame)
+    return _extract_wrist_pos(detection)
+
+
 def _extract_torso_length_px(detection: object) -> float | None:
     """Return dominant-side shoulder-to-hip length in pixels, or None."""
     if detection is None:

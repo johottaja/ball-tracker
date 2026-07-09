@@ -10,6 +10,7 @@ from tkinter import messagebox, ttk
 
 from calibration import TableCalibration
 from video_viewer.ball_motion import BALL_DETECTION_METHOD_LABELS, BallDetectionMethod
+from video_viewer.config import THROW_MODEL_PATH
 
 from .batch_process import BatchProgress, process_game_recording
 from .paths import default_game_json_name, game_json_path
@@ -89,6 +90,7 @@ class ProcessGameDialog:
         self._event_queue: queue.Queue = queue.Queue()
         self._processing = False
         self._yolo_ui: _PhaseProgressUi | None = None
+        self._gru_ui: _PhaseProgressUi | None = None
         self._tracking_ui: _PhaseProgressUi | None = None
 
     def show(self) -> None:
@@ -140,6 +142,10 @@ class ProcessGameDialog:
         ttk.Separator(self._progress_frame, orient=tk.HORIZONTAL).pack(
             fill=tk.X, pady=8
         )
+        self._gru_ui = _PhaseProgressUi(self._progress_frame, "GRU throw inference")
+        ttk.Separator(self._progress_frame, orient=tk.HORIZONTAL).pack(
+            fill=tk.X, pady=8
+        )
         self._tracking_ui = _PhaseProgressUi(self._progress_frame, "Game tracking")
         self._summary_var = tk.StringVar(value="")
         ttk.Label(
@@ -172,6 +178,9 @@ class ProcessGameDialog:
             if self._yolo_ui is not None:
                 self._yolo_ui.progress_var.set(0.0)
                 self._yolo_ui.detail_var.set("Waiting…")
+            if self._gru_ui is not None:
+                self._gru_ui.progress_var.set(0.0)
+                self._gru_ui.detail_var.set("Waiting…")
             if self._tracking_ui is not None:
                 self._tracking_ui.progress_var.set(0.0)
                 self._tracking_ui.detail_var.set("Waiting…")
@@ -252,6 +261,8 @@ class ProcessGameDialog:
     def _phase_ui(self, progress: BatchProgress) -> _PhaseProgressUi | None:
         if progress.phase == "yolo":
             return self._yolo_ui
+        if progress.phase == "gru":
+            return self._gru_ui
         return self._tracking_ui
 
     def _on_progress(self, progress: BatchProgress) -> None:
@@ -295,6 +306,18 @@ class ProcessGameDialog:
             self._yolo_ui.detail_var.set(
                 f"Done — {self._frame_count:,} frames inferred"
             )
+        if self._gru_ui is not None:
+            self._gru_ui.progress_var.set(100.0)
+            if THROW_MODEL_PATH is None or not THROW_MODEL_PATH.is_file():
+                self._gru_ui.detail_var.set("Skipped — no GRU model")
+            elif self._gru_ui.detail_var.get() == "Waiting…":
+                self._gru_ui.detail_var.set(
+                    f"Done — {self._frame_count:,} frames from cache"
+                )
+            else:
+                self._gru_ui.detail_var.set(
+                    f"Done — {self._frame_count:,} frames inferred"
+                )
         if self._tracking_ui is not None:
             self._tracking_ui.progress_var.set(100.0)
             self._tracking_ui.detail_var.set(

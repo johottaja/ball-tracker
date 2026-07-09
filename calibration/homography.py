@@ -7,9 +7,6 @@ import numpy as np
 
 from .types import CameraCalibration, TableCalibration
 
-# Typical webcam horizontal FOV used to score corner-order candidates.
-_DEFAULT_HORIZONTAL_FOV_DEG = 70.0
-
 
 def table_corner_world_coords(length_m: float, width_m: float) -> np.ndarray:
     """World (X, Y) for four table corners clicked clockwise when viewed from above (+Z).
@@ -47,99 +44,6 @@ def compute_image_to_world_homography(
     return homography.astype(np.float64)
 
 
-def order_quad_cyclic(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
-    """Return four points in cyclic order around their centroid."""
-    if len(points) != 4:
-        raise ValueError("Exactly four points are required")
-
-    centroid_x = sum(point[0] for point in points) / 4.0
-    centroid_y = sum(point[1] for point in points) / 4.0
-    return sorted(
-        points,
-        key=lambda point: math.atan2(point[1] - centroid_y, point[0] - centroid_x),
-    )
-
-
-def _focal_length_score(
-    focal: float,
-    *,
-    image_width: int,
-    image_height: int,
-    horizontal_fov_deg: float = _DEFAULT_HORIZONTAL_FOV_DEG,
-) -> float:
-    """Higher is better. Rejects implausible focal lengths."""
-    min_focal = 0.25 * max(image_width, image_height)
-    max_focal = 5.0 * max(image_width, image_height)
-    if focal < min_focal or focal > max_focal:
-        return float("-inf")
-
-    half_fov_rad = math.radians(horizontal_fov_deg / 2.0)
-    ideal_focal = (image_width / 2.0) / math.tan(half_fov_rad)
-    return -abs(math.log(focal / ideal_focal))
-
-
-def resolve_corner_mapping(
-    image_corners: list[tuple[float, float]],
-    *,
-    length_m: float,
-    width_m: float,
-    image_width: int,
-    image_height: int,
-) -> list[tuple[float, float]]:
-    """Match clicked corners to world table corners.
-
-    Clicks may be in any order. Tries cyclic permutations of the quadrilateral
-    and picks the assignment that yields a plausible focal length.
-    """
-    if len(image_corners) != 4:
-        raise ValueError("Exactly four image corners are required")
-
-    ordered = order_quad_cyclic(image_corners)
-    principal_x = image_width / 2.0
-    principal_y = image_height / 2.0
-
-    best_corners: list[tuple[float, float]] | None = None
-    best_score = float("-inf")
-    last_error: ValueError | None = None
-
-    for shift in range(4):
-        rotated = ordered[shift:] + ordered[:shift]
-        for reverse in (False, True):
-            candidate = list(reversed(rotated)) if reverse else rotated
-            try:
-                homography = compute_image_to_world_homography(
-                    candidate,
-                    length_m=length_m,
-                    width_m=width_m,
-                )
-                focal = estimate_focal_length(
-                    homography,
-                    principal_x=principal_x,
-                    principal_y=principal_y,
-                )
-                score = _focal_length_score(
-                    focal,
-                    image_width=image_width,
-                    image_height=image_height,
-                )
-                if score > best_score:
-                    best_score = score
-                    best_corners = candidate
-            except ValueError as exc:
-                last_error = exc
-
-    if best_corners is None:
-        message = (
-            "Could not match table corners to a valid camera model. "
-            "Click all four table corners so they form a clear quadrilateral."
-        )
-        if last_error is not None:
-            raise ValueError(message) from last_error
-        raise ValueError(message)
-
-    return best_corners
-
-
 def projection_matrix_from_corners(
     image_corners: list[tuple[float, float]],
     *,
@@ -147,25 +51,37 @@ def projection_matrix_from_corners(
     width_m: float,
     image_width: int,
     image_height: int,
+    focal_length_px: float | None = None,
 ) -> np.ndarray:
-    """Compute a 3×4 projection matrix from four clicked table corners."""
-    mapped_corners = resolve_corner_mapping(
+    """Compute a 3×4 projection matrix from four clicked table corners.
+
+    Clicks must be in canonical world order (clockwise from above): (+L/2,+W/2),
+    (+L/2,−W/2), (−L/2,−W/2), (−L/2,+W/2).
+
+  When ``focal_length_px`` is set, that focal length is used instead of estimating
+    it from the homography. Use this for digitally zoomed/cropped feeds where the
+    table-plane fit is correct but the inferred FOV is too narrow.
+    """
+    if len(image_corners) != 4:
+        raise ValueError("Exactly four image corners are required")
+
+    homography = compute_image_to_world_homography(
         image_corners,
         length_m=length_m,
         width_m=width_m,
-        image_width=image_width,
-        image_height=image_height,
     )
-    homography = compute_image_to_world_homography(
-        mapped_corners,
-        length_m=length_m,
-        width_m=width_m,
-    )
-    intrinsic = intrinsic_matrix_from_homography(
-        homography,
-        width=image_width,
-        height=image_height,
-    )
+    if focal_length_px is None:
+        intrinsic = intrinsic_matrix_from_homography(
+            homography,
+            width=image_width,
+            height=image_height,
+        )
+    else:
+        intrinsic = intrinsic_matrix_from_focal_length(
+            focal_length_px,
+            width=image_width,
+            height=image_height,
+        )
     return projection_matrix_from_homography(homography, intrinsic)
 
 
@@ -177,7 +93,31 @@ def build_table_calibration(
     image_height: int,
     left_corners: list[tuple[float, float]],
     right_corners: list[tuple[float, float]],
+    match_right_focal_to_left: bool = False,
+    right_horizontal_fov_deg: float | None = None,
 ) -> TableCalibration:
+    left_homography = compute_image_to_world_homography(
+        left_corners,
+        length_m=length_m,
+        width_m=width_m,
+    )
+    left_intrinsic = intrinsic_matrix_from_homography(
+        left_homography,
+        width=image_width,
+        height=image_height,
+    )
+    left_focal_px = float(left_intrinsic[0, 0])
+
+    if right_horizontal_fov_deg is not None:
+        right_focal_px = focal_length_from_horizontal_fov(
+            right_horizontal_fov_deg,
+            image_width=image_width,
+        )
+    elif match_right_focal_to_left:
+        right_focal_px = left_focal_px
+    else:
+        right_focal_px = None
+
     return TableCalibration(
         table_length_m=length_m,
         table_width_m=width_m,
@@ -186,12 +126,9 @@ def build_table_calibration(
         cameras=[
             CameraCalibration(
                 name="left",
-                projection_matrix=projection_matrix_from_corners(
-                    left_corners,
-                    length_m=length_m,
-                    width_m=width_m,
-                    image_width=image_width,
-                    image_height=image_height,
+                projection_matrix=projection_matrix_from_homography(
+                    left_homography,
+                    left_intrinsic,
                 ),
             ),
             CameraCalibration(
@@ -202,6 +139,7 @@ def build_table_calibration(
                     width_m=width_m,
                     image_width=image_width,
                     image_height=image_height,
+                    focal_length_px=right_focal_px,
                 ),
             ),
         ],
@@ -280,6 +218,35 @@ def estimate_focal_length(
     if v <= 0:
         raise ValueError("Invalid focal length from homography")
     return math.sqrt(1.0 / v)
+
+
+def intrinsic_matrix_from_focal_length(
+    focal: float,
+    *,
+    width: int,
+    height: int,
+) -> np.ndarray:
+    principal_x = width / 2.0
+    principal_y = height / 2.0
+    return np.array(
+        [
+            [focal, 0.0, principal_x],
+            [0.0, focal, principal_y],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def focal_length_from_horizontal_fov(
+    horizontal_fov_deg: float,
+    *,
+    image_width: int,
+) -> float:
+    if horizontal_fov_deg <= 0.0 or horizontal_fov_deg >= 179.0:
+        raise ValueError("Horizontal FOV must be between 0° and 179°")
+    half_fov_rad = math.radians(horizontal_fov_deg / 2.0)
+    return (image_width / 2.0) / math.tan(half_fov_rad)
 
 
 def intrinsic_matrix_from_homography(
