@@ -8,19 +8,20 @@ Guidance for AI agents working in this repository.
 
 **balltracker** is a beer pong throw tracker. The long-term goal is to record a table from two cameras at different angles, track each ball’s trajectory through the throw, and display all throws on a 3D map.
 
-**Current state:** Six Python desktop apps plus shared detection libraries:
+**Current state:** Six Python desktop apps, one React 3D viewer, plus shared detection libraries:
 
 - **`video_viewer/`** — record webcam video and inspect it frame by frame. Includes configurable **ball detection** (MOG2 + morphological closing, or frame diff → threshold) with contour/circularity filtering, plus **throw detection** (YOLOv11 pose overlay via `pose_detection`).
 - **`stereo_viewer/`** — dual-camera version of the video viewer: side-by-side live preview and playback, same filter set applied independently per camera (plus **Stereo tracking** and **Frame sync**, stereo-only). Records `left.mp4` and `right.mp4` under `stereo_viewer/recordings/`; on stop saves per-camera capture timestamps to `stereo_timeline.json` and aligns playback on a shared master timeline (no video re-encode). Playback **Preprocess** runs batched YOLO pose inference then batched GRU throw inference (`yolo_inferences.npz`, `gru_inferences.npz`).
-- **`game_tracker/`** — production dual-camera app for recording a full beer pong game. No debug filters; always runs stereo throw + ball tracking, triangulates 3D trajectories from configurable camera geometry, and saves throws to `game_tracker/games/*.json` for a future React SPA. Records native `left.mp4` / `right.mp4` under `game_tracker/recordings/` plus `stereo_timeline.json` for time-domain stereo alignment (same module as `stereo_viewer`).
+- **`game_tracker/`** — production dual-camera app for recording a full beer pong game. No debug filters; always runs stereo throw + ball tracking, triangulates 3D trajectories from configurable camera geometry, and saves throws to `game_tracker/games/*.json` for `throw_visualizer`. Records native `left.mp4` / `right.mp4` under `game_tracker/recordings/` plus `stereo_timeline.json` for time-domain stereo alignment (same module as `stereo_viewer`).
 - **`pose_detection/`** — reusable YOLO pose pipeline: per-frame dominant-hand selection and batch extraction of arm keypoints from frame sequences.
 - **`training_recorder/`** — lightweight GUI for recording labeled training clips. Enter a training set name; each clip is saved under `recordings/<training_set>/` at the repo root (separate from `video_viewer/recordings/`).
 - **`throw_detection/`** — throw-event labeling GUI, GRU training-data export, GRU training GUI, and streaming GRU inference. Labels per-frame throw/not-throw on clips from `recordings/<set>/`; saves NumPy `.npz` datasets under `throw_detection/training_sets/`; trained models under `throw_detection/models/`.
 - **`trajectory_tracking/`** — stateful ball trajectory tracker that combines throw inference with configurable ball motion masks. Three phases: detecting throw → scanning for ball in a circular sector from the wrist → tracking ball frame-by-frame. Fits a parabola to the collected positions and exposes drawing helpers for the video viewer filter.
 - **`framesync/`** — stereo camera frame-offset measurement from deliberate straight-down ball drops and table bounces. Per-camera macro phase machine plus subframe bounce-time estimation; reused by the stereo viewer **Frame sync** filter.
 - **`calibration/`** — shared table-corner calibration UI and homography math. **Calibrate** in `stereo_viewer` and `game_tracker` saves `calibration.json` at the repo root (gitignored): table dimensions, calibration frame size, per-camera 3×4 projection matrices (computed from corner clicks at save time), and persisted camera layout stats (positions, angles, FOVs, stereo baseline). The dialog can pin the right camera’s focal length to the left (for digitally cropped/zoomed feeds such as a vertical iPhone forced into 16:9) or accept an explicit right horizontal FOV. `game_tracker` triangulates 3D throws directly from the saved projection matrices via `cv2.triangulatePoints`; **Camera layout** reads the saved layout stats.
+- **`throw_visualizer/`** — React + Vite + Tailwind + Three.js SPA that loads `game_tracker/games/*.json` (or a user-uploaded file) and renders the calibrated table plus 3D throw curves. Table origin at center, playing surface at Z=0, floor at Z=−0.8 m.
 
-Dual-camera synchronized recording is available via `stereo_viewer` and `game_tracker`. Stereo 3D triangulation and JSON export are implemented in `game_tracker`; a React 3D map UI is not built yet.
+Dual-camera synchronized recording is available via `stereo_viewer` and `game_tracker`. Stereo 3D triangulation and JSON export are implemented in `game_tracker`; the initial React 3D viewer lives in `throw_visualizer/`.
 
 ## Tech stack
 
@@ -30,6 +31,7 @@ Dual-camera synchronized recording is available via `stereo_viewer` and `game_tr
 - **tkinter** — GUI (stdlib)
 - **Ultralytics** — YOLO pose model (`yolo11n-pose.pt`, gitignored; downloaded on first use)
 - **PyTorch** — GRU throw classifier training (`throw_detection/trainer`)
+- **`throw_visualizer/`** — React 19, Vite, Tailwind CSS 4, Three.js, `@react-three/fiber`, `@react-three/drei` (npm in `throw_visualizer/`, separate from Python `uv` deps)
 
 ## Running the app
 
@@ -46,6 +48,14 @@ uv run python -m throw_detection.trainer
 Alternative entry: `uv run python video_viewer/viewer.py`
 
 `main.py` at the repo root is a placeholder; use `video_viewer`, `stereo_viewer`, `game_tracker`, `training_recorder`, `throw_detection.labeller`, or `throw_detection.trainer` to run an app.
+
+3D throw viewer (separate npm project):
+
+```bash
+cd throw_visualizer && npm install && npm run dev
+```
+
+Opens Vite on `http://localhost:5173/`; auto-lists processed games from `game_tracker/games/` when present locally.
 
 ## Project structure
 
@@ -134,6 +144,14 @@ balltracker/
 │   ├── storage.py            # load/save calibration.json (+ layout attach/migrate)
 │   ├── dialog.py             # TableCalibrationDialog
 │   └── frames.py             # capture_stereo_pair from record/playback state
+├── throw_visualizer/         # React 3D viewer for game JSON throws
+│   ├── package.json
+│   ├── vite.config.ts
+│   └── src/
+│       ├── App.tsx           # game picker + file upload shell
+│       ├── games.ts          # import.meta.glob of game_tracker/games/*.json
+│       ├── coordinates.ts    # game XYZ → Three.js Y-up
+│       └── components/       # Scene, Table, ThrowCurves
 └── video_viewer/             # Viewer and CV debugging app
     ├── __init__.py
     ├── __main__.py           # `python -m video_viewer` entry
@@ -406,6 +424,6 @@ Tune via `framesync/config.py`: `DROP_STREAK_FRAMES`, `MAX_HORIZONTAL_DELTA_PX`,
 
 ## Planned direction (not yet built)
 
-- React 3D map UI showing historical throws from `game.json`
+- Richer throw visualizer UX (per-throw selection, camera layout overlay, animation)
 
 When implementing these, update this file and `README.md` to reflect new modules and workflows.
