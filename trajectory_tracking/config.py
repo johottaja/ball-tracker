@@ -13,6 +13,9 @@ SECTOR_RADIUS_PX: int = 400
 # Consecutive frames with no ball detection before the trajectory is finalised.
 TRACKING_TIMEOUT_FRAMES: int = 5
 
+# Record this many arc points before upward motion / bounce counts as a miss.
+BOUNCE_MISS_MIN_POINTS: int = 5
+
 # Frames spent in SCANNING_BALL without finding a ball before giving up.
 SCANNING_TIMEOUT_FRAMES: int = 10
 

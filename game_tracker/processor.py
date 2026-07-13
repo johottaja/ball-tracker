@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 import numpy as np
 
@@ -153,15 +153,32 @@ class GameTrackingProcessor:
                 self._secondary_pending = []
         return phase
 
+    def _capture_time(self, side: Literal["left", "right"], frame_index: int) -> float:
+        if self._stereo_timeline is not None:
+            return self._stereo_timeline.capture_time(side, frame_index)
+        return frame_index / self._fps
+
     def _capture_detection(
         self,
         phase: Phase,
         detected_pos: tuple[int, int] | None,
         frame_index: int,
         pending: list[Point2D],
+        *,
+        side: Literal["left", "right"],
     ) -> None:
-        if phase == Phase.TRACKING_BALL and detected_pos is not None:
-            pending.append(Point2D(frame=frame_index, x=detected_pos[0], y=detected_pos[1]))
+        if phase != Phase.TRACKING_BALL or detected_pos is None:
+            return
+        if self._stereo_timeline is not None and self._stereo_timeline.is_hold(side, frame_index):
+            return
+        pending.append(
+            Point2D(
+                frame=frame_index,
+                x=detected_pos[0],
+                y=detected_pos[1],
+                time_s=self._capture_time(side, frame_index),
+            )
+        )
 
     def _log_triangulation_result(
         self,
@@ -220,7 +237,12 @@ class GameTrackingProcessor:
             )
             if release is not None:
                 left_track = [
-                    Point2D(frame=release.frame, x=release.x, y=release.y),
+                    Point2D(
+                        frame=release.frame,
+                        x=release.x,
+                        y=release.y,
+                        time_s=self._capture_time("left", release.frame),
+                    ),
                     *left_track,
                 ]
                 secondary_release = find_secondary_release_at_frame(
@@ -235,6 +257,7 @@ class GameTrackingProcessor:
                             frame=secondary_release.frame,
                             x=secondary_release.x,
                             y=secondary_release.y,
+                            time_s=self._capture_time("right", secondary_release.frame),
                         ),
                         *right_track,
                     ]
@@ -386,12 +409,14 @@ class GameTrackingProcessor:
             main_result.detected_ball_pos,
             frame_index,
             self._main_pending,
+            side="left",
         )
         self._capture_detection(
             secondary_phase,
             secondary_result.detected_ball_pos,
             frame_index,
             self._secondary_pending,
+            side="right",
         )
 
         self._try_pair_throw(cache=cache.main if cache is not None else None)

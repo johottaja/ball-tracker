@@ -49,8 +49,11 @@ def _image_ray_direction(projection: np.ndarray, u: float, v: float) -> np.ndarr
     det = np.linalg.det(rotation)
     if abs(det) < 1e-9:
         return None
-    point_on_ray = np.linalg.inv(rotation) @ np.array([u, v, 1.0], dtype=np.float64)
-    direction = point_on_ray - center
+    # For P = M[X | 1], the back-projected ray is
+    # X(s) = C + s M^-1 [u, v, 1]^T, where C = -M^-1 p4.
+    # M^-1 [u, v, 1]^T is therefore already the world-space direction;
+    # subtracting C treats it as a point and corrupts FOV and pose readouts.
+    direction = np.linalg.inv(rotation) @ np.array([u, v, 1.0], dtype=np.float64)
     norm = np.linalg.norm(direction)
     if norm < 1e-9:
         return None

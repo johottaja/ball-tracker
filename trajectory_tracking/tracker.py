@@ -12,6 +12,7 @@ from .config import (
     BALL_CIRCULARITY_MAX,
     BALL_CIRCULARITY_MIN,
     BALL_CONTOUR_MIN_AREA,
+    BOUNCE_MISS_MIN_POINTS,
     MIN_TRAJECTORY_POINTS,
     SCANNING_TIMEOUT_FRAMES,
     SECTOR_ANGLE_DEG,
@@ -277,19 +278,18 @@ class TrajectoryTracker:
                 detected_pos = self._find_ball_merged(motion_mask, alternate_motion_mask)
 
                 if detected_pos is not None:
-                    self._scan_origin = detected_pos
-                    self._trajectory_points.append(detected_pos)
-                    if frame_index is not None:
-                        self._trajectory_frames.append(frame_index)
-                    self._miss_count = 0
+                    if self._accept_tracking_detection(detected_pos, frame_index):
+                        self._miss_count = 0
+                    else:
+                        self._miss_count += 1
                 else:
                     self._miss_count += 1
-                    if self._miss_count >= self.timeout_frames:
-                        saved = self._finalize_trajectory()
-                        if defer_detecting_throw:
-                            self._complete_throw_stereo(saved)
-                        else:
-                            self.phase = Phase.DETECTING_THROW
+                if self._miss_count >= self.timeout_frames:
+                    saved = self._finalize_trajectory()
+                    if defer_detecting_throw:
+                        self._complete_throw_stereo(saved)
+                    else:
+                        self.phase = Phase.DETECTING_THROW
 
         return self._result_snapshot(detected_pos)
 
@@ -416,19 +416,18 @@ class TrajectoryTracker:
                 detected_pos = self._find_ball_merged(motion_mask, alternate_motion_mask)
 
                 if detected_pos is not None:
-                    self._scan_origin = detected_pos
-                    self._trajectory_points.append(detected_pos)
-                    if frame_index is not None:
-                        self._trajectory_frames.append(frame_index)
-                    self._miss_count = 0
+                    if self._accept_tracking_detection(detected_pos, frame_index):
+                        self._miss_count = 0
+                    else:
+                        self._miss_count += 1
                 else:
                     self._miss_count += 1
-                    if self._miss_count >= self.timeout_frames:
-                        saved = self._finalize_trajectory()
-                        if defer_detecting_throw:
-                            self._complete_throw_stereo(saved)
-                        else:
-                            self.phase = Phase.DETECTING_THROW
+                if self._miss_count >= self.timeout_frames:
+                    saved = self._finalize_trajectory()
+                    if defer_detecting_throw:
+                        self._complete_throw_stereo(saved)
+                    else:
+                        self.phase = Phase.DETECTING_THROW
 
         return self._result_snapshot(detected_pos)
 
@@ -498,6 +497,44 @@ class TrajectoryTracker:
             self._mark_stereo_reconcile()
         else:
             self.phase = Phase.DETECTING_THROW
+
+    def _accept_tracking_detection(
+        self,
+        detected_pos: tuple[int, int],
+        frame_index: int | None,
+    ) -> bool:
+        """Append a tracking hit, or reject it as a table-bounce miss."""
+        self._scan_origin = detected_pos
+        if self._is_bounce_motion_miss(detected_pos):
+            return False
+        self._trajectory_points.append(detected_pos)
+        if frame_index is not None:
+            self._trajectory_frames.append(frame_index)
+        return True
+
+    def _is_bounce_motion_miss(self, detected_pos: tuple[int, int]) -> bool:
+        """
+        After enough arc points, treat upward ball motion as a miss.
+
+        Screen coordinates: +y is down. Upward world motion decreases y.
+        A table bounce shows as upward velocity and/or upward acceleration.
+        """
+        points = self._trajectory_points
+        if len(points) < BOUNCE_MISS_MIN_POINTS:
+            return False
+
+        _, last_y = points[-1]
+        vy = detected_pos[1] - last_y
+        if vy < 0:
+            return True
+
+        if len(points) >= 2:
+            _, prev_y = points[-2]
+            v_prev_y = last_y - prev_y
+            if vy - v_prev_y < 0:
+                return True
+
+        return False
 
     def _finalize_trajectory(self) -> bool:
         """Fit a parabola to collected points and save the completed trajectory.

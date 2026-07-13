@@ -276,39 +276,57 @@ def projection_matrix_from_homography(
     homography_image_to_world: np.ndarray,
     intrinsic: np.ndarray,
 ) -> np.ndarray:
-    """Derive a 3×4 camera projection matrix from a ground-plane homography and intrinsics."""
+    """Derive a 3×4 projection matrix from a ground-plane homography and intrinsics.
+
+    A plane homography is unchanged when all of its decomposed columns are
+    negated.  Those two signs put the recovered camera center on opposite sides
+    of the table, so retain the branch whose center is above the Z=0 table
+    plane.
+    """
     homography_world_to_image = np.linalg.inv(homography_image_to_world)
     m = np.linalg.inv(intrinsic) @ homography_world_to_image
 
-    r1 = m[:, 0]
-    r2 = m[:, 1]
-    t = m[:, 2]
+    homography_r1 = m[:, 0]
+    homography_r2 = m[:, 1]
+    homography_t = m[:, 2]
 
-    r1_norm = np.linalg.norm(r1)
-    r2_norm = np.linalg.norm(r2)
+    r1_norm = np.linalg.norm(homography_r1)
+    r2_norm = np.linalg.norm(homography_r2)
     if r1_norm < 1e-9 or r2_norm < 1e-9:
         raise ValueError("Degenerate homography decomposition")
 
     scale = 0.5 * (r1_norm + r2_norm)
-    r1 = r1 / scale
-    r2 = r2 / scale
-    t = t / scale
+    base_r1 = homography_r1 / scale
+    base_r2 = homography_r2 / scale
+    base_t = homography_t / scale
 
-    r3 = np.cross(r1, r2)
-    r3_norm = np.linalg.norm(r3)
-    if r3_norm < 1e-9:
-        raise ValueError("Degenerate rotation from homography")
-    r3 = r3 / r3_norm
+    candidates: list[tuple[float, np.ndarray]] = []
+    for sign in (1.0, -1.0):
+        r1 = sign * base_r1
+        r2 = sign * base_r2
+        t = sign * base_t
 
-    rotation = np.column_stack([r1, r2, r3])
-    u, _, vt = np.linalg.svd(rotation)
-    rotation = u @ vt
-    if np.linalg.det(rotation) < 0:
-        u[:, -1] *= -1
+        r3 = np.cross(r1, r2)
+        r3_norm = np.linalg.norm(r3)
+        if r3_norm < 1e-9:
+            raise ValueError("Degenerate rotation from homography")
+        r3 = r3 / r3_norm
+
+        rotation = np.column_stack([r1, r2, r3])
+        u, _, vt = np.linalg.svd(rotation)
         rotation = u @ vt
+        if np.linalg.det(rotation) < 0:
+            u[:, -1] *= -1
+            rotation = u @ vt
 
-    extrinsic = np.hstack([rotation, t.reshape(3, 1)])
-    return intrinsic @ extrinsic
+        camera_center = -rotation.T @ t
+        extrinsic = np.hstack([rotation, t.reshape(3, 1)])
+        candidates.append((float(camera_center[2]), intrinsic @ extrinsic))
+
+    above_table = [candidate for candidate in candidates if candidate[0] > 1e-9]
+    if not above_table:
+        raise ValueError("Homography decomposition places the camera on or below the table")
+    return max(above_table, key=lambda candidate: candidate[0])[1]
 
 
 def image_to_table_plane(
@@ -321,4 +339,142 @@ def image_to_table_plane(
     if abs(point[2]) < 1e-9:
         raise ValueError("Point maps to infinity on the table plane")
     return float(point[0] / point[2]), float(point[1] / point[2])
+
+
+def _world_table_to_image_px(
+    world_to_image: np.ndarray,
+    world_x: float,
+    world_y: float,
+) -> tuple[float, float] | None:
+    point = world_to_image @ np.array([world_x, world_y, 1.0], dtype=np.float64)
+    if abs(point[2]) < 1e-9:
+        return None
+    return float(point[0] / point[2]), float(point[1] / point[2])
+
+
+def _draw_world_table_line(
+    image: np.ndarray,
+    world_to_image: np.ndarray,
+    start_xy: tuple[float, float],
+    end_xy: tuple[float, float],
+    *,
+    color_bgr: tuple[int, int, int],
+    thickness: int,
+) -> None:
+    start = _world_table_to_image_px(world_to_image, start_xy[0], start_xy[1])
+    end = _world_table_to_image_px(world_to_image, end_xy[0], end_xy[1])
+    if start is None or end is None:
+        return
+
+    height, width = image.shape[:2]
+    pt1 = (int(round(start[0])), int(round(start[1])))
+    pt2 = (int(round(end[0])), int(round(end[1])))
+    ok, clipped_pt1, clipped_pt2 = cv2.clipLine((0, 0, width - 1, height - 1), pt1, pt2)
+    if not ok:
+        return
+    cv2.line(image, clipped_pt1, clipped_pt2, color_bgr, thickness, lineType=cv2.LINE_AA)
+
+
+def _grid_world_bounds_for_image(
+    image_to_world: np.ndarray,
+    *,
+    image_width: int,
+    image_height: int,
+    length_m: float,
+    width_m: float,
+    cell_size_m: float,
+) -> tuple[float, float, float, float]:
+    """World XY span that covers the image frame on the table plane, snapped to grid cells."""
+    half_length = length_m / 2.0
+    half_width = width_m / 2.0
+    world_points: list[tuple[float, float]] = [
+        (-half_length, -half_width),
+        (half_length, -half_width),
+        (half_length, half_width),
+        (-half_length, half_width),
+    ]
+
+    for pixel_x, pixel_y in (
+        (0.0, 0.0),
+        (float(image_width), 0.0),
+        (float(image_width), float(image_height)),
+        (0.0, float(image_height)),
+    ):
+        try:
+            world_points.append(image_to_table_plane(image_to_world, pixel_x, pixel_y))
+        except ValueError:
+            continue
+
+    min_x = min(point[0] for point in world_points)
+    max_x = max(point[0] for point in world_points)
+    min_y = min(point[1] for point in world_points)
+    max_y = max(point[1] for point in world_points)
+
+    min_x = math.floor(min_x / cell_size_m) * cell_size_m - cell_size_m
+    max_x = math.ceil(max_x / cell_size_m) * cell_size_m + cell_size_m
+    min_y = math.floor(min_y / cell_size_m) * cell_size_m - cell_size_m
+    max_y = math.ceil(max_y / cell_size_m) * cell_size_m + cell_size_m
+    return min_x, min_y, max_x, max_y
+
+
+def draw_table_xy_grid_on_image(
+    image: np.ndarray,
+    image_corners: list[tuple[float, float]],
+    *,
+    length_m: float,
+    width_m: float,
+    cell_size_m: float = 0.15,
+    color_bgr: tuple[int, int, int] = (239, 207, 158),
+    thickness: int = 1,
+) -> np.ndarray:
+    """Overlay metric XY grid lines on the table plane, projected into the image."""
+    if len(image_corners) != 4 or cell_size_m <= 0:
+        return image
+
+    try:
+        image_to_world = compute_image_to_world_homography(
+            image_corners,
+            length_m=length_m,
+            width_m=width_m,
+        )
+    except ValueError:
+        return image
+
+    world_to_image = np.linalg.inv(image_to_world)
+    height, width = image.shape[:2]
+    min_x, min_y, max_x, max_y = _grid_world_bounds_for_image(
+        image_to_world,
+        image_width=width,
+        image_height=height,
+        length_m=length_m,
+        width_m=width_m,
+        cell_size_m=cell_size_m,
+    )
+    out = image.copy()
+
+    y = min_y
+    while y <= max_y + 1e-9:
+        _draw_world_table_line(
+            out,
+            world_to_image,
+            (min_x, y),
+            (max_x, y),
+            color_bgr=color_bgr,
+            thickness=thickness,
+        )
+        y += cell_size_m
+
+    x = min_x
+    while x <= max_x + 1e-9:
+        _draw_world_table_line(
+            out,
+            world_to_image,
+            (x, min_y),
+            (x, max_y),
+            color_bgr=color_bgr,
+            thickness=thickness,
+        )
+        x += cell_size_m
+
+    return out
 

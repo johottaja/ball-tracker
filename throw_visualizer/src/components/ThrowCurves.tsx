@@ -1,13 +1,15 @@
 import { useMemo } from 'react'
 import * as THREE from 'three'
 import type { ThrowRecord } from '../types'
-import { gamePointsToThree } from '../coordinates'
-import { throwColor } from '../colors'
+import { extendCurveToTable, gamePointsToThree } from '../coordinates'
+import { THROW_POINT_COLOR, throwCurveColor } from '../colors'
 
 const TUBE_RADIUS = 0.01
+const POINT_RADIUS = 0.014
 
 interface ThrowCurvesProps {
   throws: ThrowRecord[]
+  selectedThrowId: number | null
 }
 
 function ThrowCurve({ points, color }: { points: THREE.Vector3[]; color: string }) {
@@ -30,14 +32,39 @@ function ThrowCurve({ points, color }: { points: THREE.Vector3[]; color: string 
   )
 }
 
-export function ThrowCurves({ throws }: ThrowCurvesProps) {
+function ThrowPoints({ points }: { points: THREE.Vector3[] }) {
+  if (points.length === 0) {
+    return null
+  }
+
   return (
     <group>
-      {throws.map((t, index) => {
-        const points =
-          t.fitted_curve_3d.length >= 2
-            ? gamePointsToThree(t.fitted_curve_3d)
-            : gamePointsToThree(t.points_3d)
+      {points.map((point, index) => (
+        <mesh key={index} position={point}>
+          <sphereGeometry args={[POINT_RADIUS, 12, 12]} />
+          <meshStandardMaterial color={THROW_POINT_COLOR} roughness={0.25} metalness={0.15} />
+        </mesh>
+      ))}
+    </group>
+  )
+}
+
+export function ThrowCurves({ throws, selectedThrowId }: ThrowCurvesProps) {
+  const selectedThrow = selectedThrowId === null
+    ? null
+    : throws.find((t) => t.id === selectedThrowId) ?? null
+
+  const selectedPoints = useMemo(
+    () => (selectedThrow ? gamePointsToThree(selectedThrow.points_3d) : []),
+    [selectedThrow],
+  )
+
+  return (
+    <group>
+      {throws.map((t) => {
+        const curvePoints =
+          t.fitted_curve_3d.length >= 2 ? t.fitted_curve_3d : t.points_3d
+        const points = gamePointsToThree(extendCurveToTable(curvePoints))
 
         if (points.length < 2) {
           return null
@@ -47,10 +74,11 @@ export function ThrowCurves({ throws }: ThrowCurvesProps) {
           <ThrowCurve
             key={t.id}
             points={points}
-            color={throwColor(index, throws.length)}
+            color={throwCurveColor(t.id, selectedThrowId)}
           />
         )
       })}
+      {selectedPoints.length > 0 && <ThrowPoints points={selectedPoints} />}
     </group>
   )
 }

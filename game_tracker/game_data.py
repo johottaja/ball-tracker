@@ -24,9 +24,13 @@ class Point2D:
     frame: int
     x: int
     y: int
+    time_s: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"frame": self.frame, "x": self.x, "y": self.y}
+        d: dict[str, Any] = {"frame": self.frame, "x": self.x, "y": self.y}
+        if self.time_s is not None:
+            d["time_s"] = self.time_s
+        return d
 
 
 @dataclass
@@ -120,7 +124,13 @@ class GameSession:
             tracks_2d: dict[str, list[Point2D]] = {}
             for camera, points in item.get("tracks_2d", {}).items():
                 tracks_2d[camera] = [
-                    Point2D(frame=p["frame"], x=p["x"], y=p["y"]) for p in points
+                    Point2D(
+                        frame=p["frame"],
+                        x=p["x"],
+                        y=p["y"],
+                        time_s=float(p["time_s"]) if "time_s" in p else None,
+                    )
+                    for p in points
                 ]
             throws.append(
                 ThrowRecord(

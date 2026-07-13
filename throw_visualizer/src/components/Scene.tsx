@@ -8,9 +8,10 @@ import { Cameras } from './Cameras'
 
 interface SceneProps {
   game: GameSession
+  selectedThrowId: number | null
 }
 
-function SceneContent({ game }: SceneProps) {
+function SceneContent({ game, selectedThrowId }: SceneProps) {
   const { lengthM, widthM } = tableDimensions(game)
 
   return (
@@ -23,7 +24,7 @@ function SceneContent({ game }: SceneProps) {
       {game.calibration?.layout?.cameras && (
         <Cameras cameras={game.calibration.layout.cameras} />
       )}
-      <ThrowCurves throws={game.throws} />
+      <ThrowCurves throws={game.throws} selectedThrowId={selectedThrowId} />
 
       <OrbitControls
         makeDefault
@@ -36,7 +37,7 @@ function SceneContent({ game }: SceneProps) {
   )
 }
 
-export function Scene({ game }: SceneProps) {
+export function Scene({ game, selectedThrowId }: SceneProps) {
   return (
     <Canvas
       camera={{ position: [2.2, 1.4, 2.2], fov: 50, near: 0.05, far: 50 }}
@@ -45,7 +46,7 @@ export function Scene({ game }: SceneProps) {
     >
       <color attach="background" args={['#0f1115']} />
       <fog attach="fog" args={['#0f1115', 6, 18]} />
-      <SceneContent game={game} />
+      <SceneContent game={game} selectedThrowId={selectedThrowId} />
     </Canvas>
   )
 }

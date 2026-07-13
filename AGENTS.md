@@ -55,7 +55,7 @@ Alternative entry: `uv run python video_viewer/viewer.py`
 cd throw_visualizer && npm install && npm run dev
 ```
 
-Opens Vite on `http://localhost:5173/`; auto-lists processed games from `game_tracker/games/` when present locally.
+Opens Vite on `http://localhost:5173/`; lists processed games from `game_tracker/games/` via a dev-server `/api/games` endpoint (refresh button or window focus — no server restart needed).
 
 ## Project structure
 
@@ -149,7 +149,7 @@ balltracker/
 │   ├── vite.config.ts
 │   └── src/
 │       ├── App.tsx           # game picker + file upload shell
-│       ├── games.ts          # import.meta.glob of game_tracker/games/*.json
+│       ├── games.ts          # fetch /api/games at runtime
 │       ├── coordinates.ts    # game XYZ → Three.js Y-up
 │       └── components/       # Scene, Table, ThrowCurves
 └── video_viewer/             # Viewer and CV debugging app
@@ -198,8 +198,8 @@ balltracker/
 | **game_tracker** | |
 | `game_tracker/app.py` | `GameTrackerApp` — dual-camera record/playback, ball-detection method, table calibration; **Import from stereo viewer** copies `stereo_viewer/recordings/left.mp4` and `right.mp4` into game tracker recordings |
 | `game_tracker/config.py` | `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `GAME_JSON` |
-| `game_tracker/processor.py` | `GameTrackingProcessor` — stereo GRU + ball tracking, frame-indexed 2D capture, triangulation, incremental `game.json` writes |
-| `game_tracker/triangulation.py` | `cv2.triangulatePoints` from calibration projection matrices; quadratic 3D curve fit; speed from 3D arc length |
+| `game_tracker/processor.py` | `GameTrackingProcessor` — stereo GRU + ball tracking, native-capture-time 2D observations, triangulation, incremental `game.json` writes |
+| `game_tracker/triangulation.py` | `cv2.triangulatePoints` from calibration projection matrices; matches tracks at actual per-camera capture times, quadratic 3D curve fit, speed from 3D arc length |
 | `game_tracker/game_data.py` | `GameSession`, `ThrowRecord`, JSON save/load (atomic temp + rename) |
 | **video_viewer** | |
 | `app.py` | `VideoViewerApp` — modes (record/playback), UI, frame stepping, filter wiring |
@@ -302,7 +302,7 @@ The video viewer **GRU throw inference** filter (`FilterId.GRU_THROW_INFERENCE`)
 
 1. **DETECTING_THROW** — waits for `throw_label == 1` from the GRU inference. When detected, moves to phase 2 using the wrist position as the sector origin.
 2. **SCANNING_BALL** — on every frame while the throw label is 1, re-anchors the sector at the wrist and pauses the scan timer. Searches the motion mask for the largest circular contour whose centroid lies inside a circular sector: `sector_radius` pixels from the wrist, centered on the elbow→wrist arm direction, ±`sector_half_angle` degrees wide. When a contour is found, transitions to phase 3. After the throw label returns to 0, exits if no ball was found within `SCANNING_TIMEOUT_FRAMES` (stereo: follow partner; mono: `DETECTING_THROW`).
-3. **TRACKING_BALL** — records ball centroid positions. Each frame the sector is re-centered on the last detection and the direction is updated to the previous→current ball vector. If `timeout_frames` consecutive frames yield no detection, the trajectory is finalised: `numpy.polyfit` fits a degree-2 polynomial (y=f(x) or x=f(y) depending on aspect ratio) and 120 sampled curve points are stored. The tracker then returns to phase 1.
+3. **TRACKING_BALL** — records ball centroid positions. Each frame the sector is re-centered on the last detection and the direction is updated to the previous→current ball vector. After `BOUNCE_MISS_MIN_POINTS` (default 5) arc points, detections with upward screen motion (table bounce / rebound) count as misses — upward velocity or upward acceleration — so the initial upward release arc is still recorded. If `timeout_frames` consecutive frames yield no detection or bounce misses, the trajectory is finalised: `numpy.polyfit` fits a degree-2 polynomial (y=f(x) or x=f(y) depending on aspect ratio) and 120 sampled curve points are stored. The tracker then returns to phase 1.
 
 A new throw label while in phase 3 immediately finalises the current trajectory and re-enters phase 2.
 
@@ -332,11 +332,11 @@ Production app for recording a beer pong session and exporting 3D throw trajecto
 
 **Offline processing (`batch_process.process_game_recording`):** three phases — batched YOLO pose (`yolo_inferences.npz`), batched GRU throw labels on the main camera from pose features (`gru_inferences.npz`, keyed to the active `.pt` model), then ball/trajectory tracking with both caches loaded into `PlaybackCache`.
 
-**Tracking (`GameTrackingProcessor`):** Active during batch processing after record. Main (left) camera: GRU throw inference + wrist-anchored ball tracking. Secondary (right): ball tracking driven by main throw label, with wrist-anchored sector scan on the right feed during **scanning ball** (right YOLO from preprocess cache or live inference; full-frame fallback when pose is missing). Stereo phase gate (`AWAITING_PARTNER`) pairs valid completions across cameras; failed tracks adopt the partner phase via `trajectory_tracking.stereo.reconcile_stereo_trackers`. Frame-indexed 2D detections captured during `TRACKING_BALL` on the master timeline; when both cameras complete a throw, `triangulate_throw` pairs left/right by master capture time from `stereo_timeline.json` (linear interpolation on the secondary track). Speed uses actual slot durations from the timeline, not nominal FPS.
+**Tracking (`GameTrackingProcessor`):** Active during batch processing after record. Main (left) camera: GRU throw inference + wrist-anchored ball tracking. Secondary (right): ball tracking driven by main throw label, with wrist-anchored sector scan on the right feed during **scanning ball** (right YOLO from preprocess cache or live inference; full-frame fallback when pose is missing). Stereo phase gate (`AWAITING_PARTNER`) pairs valid completions across cameras; failed tracks adopt the partner phase via `trajectory_tracking.stereo.reconcile_stereo_trackers`. While in `TRACKING_BALL`, each non-held native camera frame becomes a 2D observation tagged with its actual capture time. When both cameras complete a throw, `triangulate_throw` linearly interpolates the right track at each left observation time (rejecting gaps over 100 ms), then triangulates each pair. Speed uses actual slot durations from the timeline, not nominal FPS.
 
 **3D coordinate system:** Origin at table center; X along table length, Y along width, Z up from table (meters). **Calibrate** saves 3×4 projection matrices per camera (derived from corner clicks + focal-length estimation at save time). Per-point triangulation via `cv2.triangulatePoints` on temporally aligned 2D pairs (`secondary_frame = main_frame + offset` when offset is known). Video frame size must match the calibration frame size. 3D speed from fitted curve arc length ÷ throw duration. Requires `calibration.json` at repo root (saved via **Calibrate**).
 
-**`game.json` schema (version 1):** `recorded_at`, `fps`, `frame_count`, `videos`, `coordinate_system`, optional `calibration` (full `calibration.json` snapshot including `layout` stats, written at process time), `throws[]` with `id`, `start_frame`, `end_frame`, `points_3d`, `fitted_curve_3d`, `speed_m_s`, `tracks_2d` (left/right pixel tracks). Designed for consumption by a future React SPA.
+**`game.json` schema (version 1):** `recorded_at`, `fps`, `frame_count`, `videos`, `coordinate_system`, optional `calibration` (full `calibration.json` snapshot including `layout` stats, written at process time), `throws[]` with `id`, `start_frame`, `end_frame`, `points_3d`, `fitted_curve_3d`, `speed_m_s`, `tracks_2d` (left/right pixel tracks, with optional native-camera `time_s`). Designed for consumption by a future React SPA.
 
 ## Frame sync (`framesync`)
 
@@ -393,7 +393,7 @@ Tune via `framesync/config.py`: `DROP_STREAK_FRAMES`, `MAX_HORIZONTAL_DELTA_PX`,
 **`trajectory_tracking/config.py`**
 
 - **Sector:** `SECTOR_ANGLE_DEG` (full angular width, default 150°), `SECTOR_DIRECTION_DEG` (sector center direction, default 135° = left tilted 45° downward), `SECTOR_RADIUS_PX` (max search distance in pixels, default 400)
-- **Tracking:** `TRACKING_TIMEOUT_FRAMES` (consecutive miss frames before trajectory is finalised, default 5)
+- **Tracking:** `TRACKING_TIMEOUT_FRAMES` (consecutive miss frames before trajectory is finalised, default 5), `BOUNCE_MISS_MIN_POINTS` (arc points before upward-motion bounce frames count as misses, default 5)
 - **Scan timeout:** `SCANNING_TIMEOUT_FRAMES` (default 10) — consecutive frames in `SCANNING_BALL` with throw label 0 and no ball detection
 - **Partner wait:** `AWAITING_PARTNER_TIMEOUT_FRAMES` (default 10) — max frames in `AWAITING_PARTNER` before returning to idle (incl. discarded throws)
 - **Circularity:** `BALL_CIRCULARITY_MIN / MAX` in `trajectory_tracking/config.py` (defaults 0.4–1.0; re-exported from `video_viewer/config.py` for ball detection)

@@ -36,11 +36,6 @@ def source_indices_for_even_extension(
     ]
 
 
-def _relative_timestamps(timestamps: list[float]) -> list[float]:
-    origin = timestamps[0]
-    return [timestamp - origin for timestamp in timestamps]
-
-
 def indices_for_lagging_stream(
     lagging_timestamps: list[float],
     reference_timestamps: list[float],
@@ -53,14 +48,12 @@ def indices_for_lagging_stream(
     if not lagging_timestamps or not reference_timestamps:
         return []
 
-    lagging_rel = _relative_timestamps(lagging_timestamps)
-    reference_rel = _relative_timestamps(reference_timestamps)
     indices: list[int] = []
     source_index = 0
-    for slot_time in reference_rel:
+    for slot_time in reference_timestamps:
         while (
-            source_index + 1 < len(lagging_rel)
-            and lagging_rel[source_index + 1] <= slot_time
+            source_index + 1 < len(lagging_timestamps)
+            and lagging_timestamps[source_index + 1] <= slot_time
         ):
             source_index += 1
         indices.append(source_index)

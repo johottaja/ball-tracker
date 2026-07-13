@@ -51,6 +51,8 @@ class StereoTimeline:
     fps: float
     reference: Literal["left", "right"]
     master_times: tuple[float, ...]
+    left_capture_times: tuple[float, ...]
+    right_capture_times: tuple[float, ...]
     left_source_indices: tuple[int, ...]
     right_source_indices: tuple[int, ...]
     left_frame_count: int
@@ -99,6 +101,12 @@ class StereoTimeline:
     def time_at_frame(self, frame: int) -> float:
         return self.master_times[frame]
 
+    def capture_time(self, side: Literal["left", "right"], master_index: int) -> float:
+        """Actual capture time for the native frame shown in a master slot."""
+        source_index = self.source_index(side, master_index)
+        times = self.left_capture_times if side == "left" else self.right_capture_times
+        return times[source_index]
+
     def duration_between_frames_s(self, start_frame: int, end_frame: int) -> float:
         if end_frame <= start_frame:
             return 0.0
@@ -129,12 +137,14 @@ class StereoTimeline:
 
         if left_count >= right_count:
             reference: Literal["left", "right"] = "left"
-            master_times = _relative_timestamps(left_timestamps)
+            origin = min(left_timestamps[0], right_timestamps[0])
+            master_times = _relative_timestamps(left_timestamps, origin=origin)
             left_indices = list(range(left_count))
             right_indices = indices_for_lagging_stream(right_timestamps, left_timestamps)
         else:
             reference = "right"
-            master_times = _relative_timestamps(right_timestamps)
+            origin = min(left_timestamps[0], right_timestamps[0])
+            master_times = _relative_timestamps(right_timestamps, origin=origin)
             right_indices = list(range(right_count))
             left_indices = indices_for_lagging_stream(left_timestamps, right_timestamps)
 
@@ -145,6 +155,8 @@ class StereoTimeline:
             fps=fps,
             reference=reference,
             master_times=tuple(master_times),
+            left_capture_times=tuple(_relative_timestamps(left_timestamps, origin=origin)),
+            right_capture_times=tuple(_relative_timestamps(right_timestamps, origin=origin)),
             left_source_indices=tuple(left_indices),
             right_source_indices=tuple(right_indices),
             left_frame_count=left_count,
@@ -173,6 +185,8 @@ class StereoTimeline:
             master_count = max(left_frame_count, right_frame_count)
         frame_time = 1.0 / fps if fps > 0 else 1.0 / 30.0
         master_times = tuple(index * frame_time for index in range(master_count))
+        left_capture_times = tuple(index * frame_time for index in range(left_frame_count))
+        right_capture_times = tuple(index * frame_time for index in range(right_frame_count))
         left_indices = tuple(
             min(index, max(left_frame_count - 1, 0)) for index in range(master_count)
         )
@@ -186,6 +200,8 @@ class StereoTimeline:
             fps=fps,
             reference=reference,
             master_times=master_times,
+            left_capture_times=left_capture_times,
+            right_capture_times=right_capture_times,
             left_source_indices=left_indices,
             right_source_indices=right_indices,
             left_frame_count=left_frame_count,
@@ -193,8 +209,9 @@ class StereoTimeline:
         )
 
 
-def _relative_timestamps(timestamps: list[float]) -> list[float]:
-    origin = timestamps[0]
+def _relative_timestamps(timestamps: list[float], *, origin: float | None = None) -> list[float]:
+    if origin is None:
+        origin = timestamps[0]
     return [timestamp - origin for timestamp in timestamps]
 
 

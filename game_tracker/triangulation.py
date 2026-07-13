@@ -11,6 +11,7 @@ from calibration import TableCalibration
 from video_viewer.stereo_timeline import StereoTimeline
 
 from .config import (
+    MAX_TRACK_INTERPOLATION_GAP_S,
     MAX_TRIANGULATION_HEIGHT_M,
     MAX_TRIANGULATION_RESIDUAL_M,
     MIN_TRIANGULATION_HEIGHT_M,
@@ -151,13 +152,17 @@ def interpolate_track_at_time(
     target_time: float,
     *,
     time_at_frame: Callable[[int], float],
+    max_interpolation_gap_s: float = MAX_TRACK_INTERPOLATION_GAP_S,
 ) -> tuple[float, float] | None:
-    """Linear interpolation of a 2D track at a wall-clock time on the master timeline."""
+    """Linearly interpolate a camera's 2D track at an actual capture time."""
     if not track:
         return None
 
-    ordered = sorted(track, key=lambda point: point.frame)
-    times = [time_at_frame(point.frame) for point in ordered]
+    def point_time(point: Point2D) -> float:
+        return point.time_s if point.time_s is not None else time_at_frame(point.frame)
+
+    ordered = sorted(track, key=point_time)
+    times = [point_time(point) for point in ordered]
     if target_time < times[0] or target_time > times[-1]:
         return None
 
@@ -167,8 +172,14 @@ def interpolate_track_at_time(
         start_time = times[index]
         end_time = times[index + 1]
         if start_time <= target_time <= end_time:
+            if target_time == start_time:
+                return float(start.x), float(start.y)
+            if target_time == end_time:
+                return float(end.x), float(end.y)
             if end_time == start_time:
                 return float(start.x), float(start.y)
+            if end_time - start_time > max_interpolation_gap_s:
+                return None
             t = (target_time - start_time) / (end_time - start_time)
             x = start.x + t * (end.x - start.x)
             y = start.y + t * (end.y - start.y)
@@ -284,8 +295,12 @@ def triangulate_throw(
 
         left_frames_attempted += 1
 
-        if timeline is not None:
-            target_time = timeline.time_at_frame(left_point.frame)
+        if timeline is not None or left_point.time_s is not None:
+            target_time = (
+                left_point.time_s
+                if left_point.time_s is not None
+                else timeline.time_at_frame(left_point.frame)
+            )
             secondary_coords = interpolate_track_at_time(
                 right_track,
                 target_time,
