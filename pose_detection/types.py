@@ -6,6 +6,7 @@ from typing import Literal
 import numpy as np
 
 HandSide = Literal["left", "right"]
+PlayerSide = Literal["left", "right"]
 
 
 @dataclass(frozen=True)

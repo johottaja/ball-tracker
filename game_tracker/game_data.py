@@ -66,6 +66,7 @@ class ThrowRecord:
     fitted_curve_3d: list[CurvePoint3D]
     speed_m_s: float | None
     tracks_2d: dict[str, list[Point2D]]
+    thrower_side: str = "right"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -75,6 +76,7 @@ class ThrowRecord:
             "points_3d": [p.to_dict() for p in self.points_3d],
             "fitted_curve_3d": [p.to_dict() for p in self.fitted_curve_3d],
             "speed_m_s": self.speed_m_s,
+            "thrower_side": self.thrower_side,
             "tracks_2d": {
                 camera: [p.to_dict() for p in points]
                 for camera, points in self.tracks_2d.items()
@@ -156,6 +158,7 @@ class GameSession:
                     ],
                     speed_m_s=item.get("speed_m_s"),
                     tracks_2d=tracks_2d,
+                    thrower_side=str(item.get("thrower_side", "right")),
                 )
             )
 

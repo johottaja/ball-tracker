@@ -115,6 +115,7 @@ class GameTrackerApp:
         self.stereo_timeline = None
         self.stereo_reader: StereoFrameReader | None = None
         self.stereo_tracking = StereoTrackingProcessor(enable_framesync=False)
+        self.stereo_tracking.set_calibration(self.calibration)
         self.playback_cache = PlaybackCache()
         self.ball_method_var = tk.StringVar(
             value=BALL_DETECTION_METHOD_LABELS[BallDetectionMethod.MOG2_CLOSING]
@@ -317,6 +318,7 @@ class GameTrackerApp:
 
     def _on_calibration_saved(self, calibration: TableCalibration) -> None:
         self.calibration = calibration
+        self.stereo_tracking.set_calibration(calibration)
 
     def _open_camera_layout(self) -> None:
         CameraLayoutDialog(self.root, self.calibration).show()

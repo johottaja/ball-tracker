@@ -74,7 +74,7 @@ export function ThrowCurves({ throws, selectedThrowId }: ThrowCurvesProps) {
           <ThrowCurve
             key={t.id}
             points={points}
-            color={throwCurveColor(t.id, selectedThrowId)}
+            color={throwCurveColor(t.id, selectedThrowId, t.thrower_side)}
           />
         )
       })}

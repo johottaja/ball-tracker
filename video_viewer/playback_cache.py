@@ -12,6 +12,7 @@ class SyncEvent:
     offset: float
 
 from pose_detection import DominantHandDetection, PoseDetector, detect_dominant_hand_detection
+from pose_detection.types import PlayerSide
 from throw_detection.inference import ThrowPrediction
 
 from .ball_motion import BallDetectionMethod
@@ -23,6 +24,12 @@ class StreamPlaybackCache:
 
     _pose: dict[int, DominantHandDetection | None] = field(default_factory=dict)
     _gru: dict[int, ThrowPrediction] = field(default_factory=dict)
+    _player_pose: dict[tuple[PlayerSide, int], DominantHandDetection | None] = field(
+        default_factory=dict
+    )
+    _player_gru: dict[tuple[PlayerSide, int], ThrowPrediction] = field(
+        default_factory=dict
+    )
     _motion_masks: dict[tuple[BallDetectionMethod, int], np.ndarray] = field(
         default_factory=dict
     )
@@ -33,6 +40,8 @@ class StreamPlaybackCache:
     def clear(self) -> None:
         self._pose.clear()
         self._gru.clear()
+        self._player_pose.clear()
+        self._player_gru.clear()
         self._motion_masks.clear()
         self._filter_outputs.clear()
 
@@ -51,6 +60,22 @@ class StreamPlaybackCache:
     def put_pose(self, frame_index: int, detection: DominantHandDetection | None) -> None:
         self._pose[frame_index] = detection
 
+    def has_player_pose(self, player_side: PlayerSide, frame_index: int) -> bool:
+        return (player_side, frame_index) in self._player_pose
+
+    def get_player_pose(
+        self, player_side: PlayerSide, frame_index: int
+    ) -> DominantHandDetection | None:
+        return self._player_pose[(player_side, frame_index)]
+
+    def put_player_pose(
+        self,
+        player_side: PlayerSide,
+        frame_index: int,
+        detection: DominantHandDetection | None,
+    ) -> None:
+        self._player_pose[(player_side, frame_index)] = detection
+
     def has_gru(self, frame_index: int) -> bool:
         return frame_index in self._gru
 
@@ -59,6 +84,20 @@ class StreamPlaybackCache:
 
     def put_gru(self, frame_index: int, prediction: ThrowPrediction) -> None:
         self._gru[frame_index] = prediction
+
+    def has_player_gru(self, player_side: PlayerSide, frame_index: int) -> bool:
+        return (player_side, frame_index) in self._player_gru
+
+    def get_player_gru(self, player_side: PlayerSide, frame_index: int) -> ThrowPrediction:
+        return self._player_gru[(player_side, frame_index)]
+
+    def put_player_gru(
+        self,
+        player_side: PlayerSide,
+        frame_index: int,
+        prediction: ThrowPrediction,
+    ) -> None:
+        self._player_gru[(player_side, frame_index)] = prediction
 
     def has_motion_mask(self, method: BallDetectionMethod, frame_index: int) -> bool:
         return (method, frame_index) in self._motion_masks

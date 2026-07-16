@@ -242,7 +242,15 @@ def process_game_recording(
 
     gru_store: GruInferenceStore | None = None
     if THROW_MODEL_PATH is not None and THROW_MODEL_PATH.is_file():
-        if gru_cache_status(GRU_INFERENCES, frame_count, THROW_MODEL_PATH) == "ready":
+        if (
+            gru_cache_status(
+                GRU_INFERENCES,
+                frame_count,
+                THROW_MODEL_PATH,
+                require_player_slots=True,
+            )
+            == "ready"
+        ):
             gru_store = load_gru_inferences(GRU_INFERENCES)
         else:
             gru_store = run_stereo_gru_inference_phase(

@@ -3,8 +3,10 @@ from __future__ import annotations
 import numpy as np
 
 from framesync import FrameSyncEngine, draw_framesync_overlay
+from pose_detection.types import PlayerSide
+from calibration import TableCalibration, infer_stereo_screen_side_mapping
 from framesync.playback import prepare_framesync_for_frame, record_framesync_completion
-from throw_detection.inference import ThrowInference
+from throw_detection.inference import ThrowInference, ThrowPrediction
 from trajectory_tracking import Phase, TrajectoryTracker
 from trajectory_tracking.stereo import reconcile_stereo_trackers
 from trajectory_tracking.drawing import draw_trajectory_overlay
@@ -22,6 +24,7 @@ from video_viewer.pose_overlay import apply_gru_throw_inference
 from video_viewer.stereo_ball_detection import detect_stereo_balls
 from video_viewer.stereo_playback import tracker_throw_label_during_left_hold
 from video_viewer.stereo_timeline import StereoTimeline
+from trajectory_tracking.config import SECTOR_DIRECTION_DEG
 
 
 class StereoTrackingProcessor:
@@ -44,6 +47,8 @@ class StereoTrackingProcessor:
         self._main_last_completion_id: int = 0
         self._secondary_last_completion_id: int = 0
         self._last_frame_index: int | None = None
+        self._active_player_side: PlayerSide | None = None
+        self._secondary_side_for_main: dict[PlayerSide, PlayerSide] | None = None
 
     @property
     def framesync_offset(self) -> float | None:
@@ -54,6 +59,23 @@ class StereoTrackingProcessor:
     def set_ball_detection_method(self, method: BallDetectionMethod) -> None:
         self._main_motion.set_method(method)
         self._secondary_motion.set_method(method)
+
+    def set_calibration(self, calibration: TableCalibration | None) -> None:
+        """Configure main-to-secondary player-side correspondence for scanning."""
+        mapping = (
+            infer_stereo_screen_side_mapping(calibration)
+            if calibration is not None
+            else None
+        )
+        if mapping is None:
+            self._secondary_side_for_main = None
+            return
+        self._secondary_side_for_main = {
+            "left": mapping.main_left_to_secondary,
+            "right": (
+                "right" if mapping.main_left_to_secondary == "left" else "left"
+            ),
+        }
 
     def reset(self) -> None:
         if self._throw_inference is not None:
@@ -70,6 +92,50 @@ class StereoTrackingProcessor:
         self._main_last_completion_id = 0
         self._secondary_last_completion_id = 0
         self._last_frame_index = None
+        self._active_player_side = None
+
+    @staticmethod
+    def _sector_direction_for_side(player_side: PlayerSide) -> float:
+        return (
+            SECTOR_DIRECTION_DEG
+            if player_side == "right"
+            else (180.0 - SECTOR_DIRECTION_DEG) % 360.0
+        )
+
+    def _cached_player_prediction(
+        self,
+        cache: object | None,
+        frame_index: int | None,
+    ) -> tuple[PlayerSide, ThrowPrediction] | None:
+        """Choose a cached two-player prediction without hiding a valid left pose."""
+        if cache is None or frame_index is None:
+            return None
+        candidates = [
+            (player_side, cache.main.get_player_gru(player_side, frame_index))
+            for player_side in ("left", "right")
+            if cache.main.has_player_gru(player_side, frame_index)
+        ]
+        if not candidates:
+            return None
+        if self._active_player_side is not None:
+            active = next(
+                (
+                    item
+                    for item in candidates
+                    if item[0] == self._active_player_side
+                ),
+                None,
+            )
+            if active is not None:
+                return active
+        throwing = [item for item in candidates if item[1].label == 1]
+        if throwing:
+            return max(throwing, key=lambda item: item[1].probability)
+        right = next(
+            (item for item in candidates if item[0] == "right" and item[1].has_pose),
+            None,
+        )
+        return right or next((item for item in candidates if item[1].has_pose), candidates[0])
 
     def throw_buffer_size(self) -> int:
         inference = self._ensure_throw_inference()
@@ -150,6 +216,7 @@ class StereoTrackingProcessor:
             self._main_last_completion_id = 0
             self._secondary_last_completion_id = 0
             self._last_frame_index = None
+            self._active_player_side = None
 
         if self._enable_framesync and frame_index is not None:
             self._last_frame_index = prepare_framesync_for_frame(
@@ -228,13 +295,25 @@ class StereoTrackingProcessor:
                 )
             return main_output, secondary_output
 
-        prediction = inference.predict(
-            main_frame,
-            warmup_frames=main_warmup_frames,
-            warmup_start_index=main_warmup_start_index,
-            cache=cache.main if cache is not None else None,
-            frame_index=frame_index,
-        )
+        cached_prediction = self._cached_player_prediction(cache, frame_index)
+        if cached_prediction is not None:
+            player_side, prediction = cached_prediction
+        else:
+            player_side = "right"
+            prediction = inference.predict(
+                main_frame,
+                warmup_frames=main_warmup_frames,
+                warmup_start_index=main_warmup_start_index,
+                cache=cache.main if cache is not None else None,
+                frame_index=frame_index,
+            )
+        if self._active_player_side is None and prediction.label == 1:
+            self._active_player_side = player_side
+        if self._active_player_side is not None:
+            player_side = self._active_player_side
+            self._main_tracker.set_sector_direction_deg(
+                self._sector_direction_for_side(player_side)
+            )
         self._torso_length_buffer.add(_extract_torso_length_px(prediction.detection))
         throw_label = tracker_throw_label_during_left_hold(
             prediction.label,
@@ -245,12 +324,33 @@ class StereoTrackingProcessor:
 
         main_wrist_pos = _extract_wrist_pos(prediction.detection)
         secondary_wrist_pos: tuple[int, int] | None = None
-        if throw_label == 1 or self._secondary_tracker.phase == Phase.SCANNING_BALL:
-            secondary_wrist_pos = wrist_pos_from_frame(
-                secondary_frame,
-                cache=cache.secondary if cache is not None else None,
-                frame_index=frame_index,
+        secondary_player_side = (
+            self._secondary_side_for_main[player_side]
+            if self._secondary_side_for_main is not None
+            else None
+        )
+        if secondary_player_side is not None:
+            self._secondary_tracker.set_sector_direction_deg(
+                self._sector_direction_for_side(secondary_player_side)
             )
+        if throw_label == 1 or self._secondary_tracker.phase == Phase.SCANNING_BALL:
+            if (
+                secondary_player_side is not None
+                and cache is not None
+                and frame_index is not None
+            ):
+                secondary_detection = (
+                    cache.secondary.get_player_pose(secondary_player_side, frame_index)
+                    if cache.secondary.has_player_pose(secondary_player_side, frame_index)
+                    else None
+                )
+                secondary_wrist_pos = _extract_wrist_pos(secondary_detection)
+            else:
+                secondary_wrist_pos = wrist_pos_from_frame(
+                    secondary_frame,
+                    cache=cache.secondary if cache is not None else None,
+                    frame_index=frame_index,
+                )
 
         main_result = self._main_tracker.update(
             throw_label=throw_label,
@@ -275,6 +375,12 @@ class StereoTrackingProcessor:
             wrist_pos=main_wrist_pos,
             secondary_wrist_pos=secondary_wrist_pos,
         )
+        if (
+            self._active_player_side is not None
+            and self._main_tracker.phase == Phase.DETECTING_THROW
+            and self._secondary_tracker.phase == Phase.DETECTING_THROW
+        ):
+            self._active_player_side = None
 
         if main_result.completion_id != self._main_last_completion_id:
             self._main_tracker.apply_release_extension(

@@ -261,6 +261,7 @@ def triangulate_throw(
     frame_size: tuple[int, int],
     fps: float,
     throw_id: int,
+    thrower_side: str = "right",
     timeline: StereoTimeline | None = None,
     frame_offset: float | None = None,
 ) -> TriangulationResult:
@@ -384,5 +385,6 @@ def triangulate_throw(
             fitted_curve_3d=fitted,
             speed_m_s=speed_m_s,
             tracks_2d={"left": list(left_track), "right": list(right_track)},
+            thrower_side=thrower_side,
         )
     )

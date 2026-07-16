@@ -11,6 +11,7 @@ export interface ThrowRecord {
   points_3d: CurvePoint3D[]
   fitted_curve_3d: CurvePoint3D[]
   speed_m_s: number | null
+  thrower_side?: 'left' | 'right'
 }
 
 export interface CameraLayoutStats {

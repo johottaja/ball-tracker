@@ -11,6 +11,7 @@ import torch
 from throw_detection.features import rolling_windows
 from throw_detection.inference import ThrowPrediction, features_from_detection
 from throw_detection.model import load_throw_model
+from pose_detection.types import PlayerSide
 from video_viewer.playback_cache import PlaybackCache, StreamPlaybackCache
 from video_viewer.yolo_batch import MonoYoloInferenceStore, StereoYoloInferenceStore
 
@@ -60,16 +61,27 @@ class GruInferenceStore:
         frame_index: int,
         *,
         detection: object | None,
+        player_side: PlayerSide = "right",
     ) -> ThrowPrediction:
         from pose_detection import DominantHandDetection
 
         det = detection if isinstance(detection, DominantHandDetection) else None
+        slot = 0 if player_side == "left" else 1
+        labels = self.labels[frame_index]
+        logits = self.logits[frame_index]
+        probabilities = self.probabilities[frame_index]
+        has_pose = self.has_pose[frame_index]
+        if self.labels.ndim > 1:
+            labels = labels[slot]
+            logits = logits[slot]
+            probabilities = probabilities[slot]
+            has_pose = has_pose[slot]
         return ThrowPrediction(
-            label=int(self.labels[frame_index]),
-            logit=float(self.logits[frame_index]),
-            probability=float(self.probabilities[frame_index]),
-            has_pose=bool(self.has_pose[frame_index]),
-            detection=det if self.has_pose[frame_index] else None,
+            label=int(labels),
+            logit=float(logits),
+            probability=float(probabilities),
+            has_pose=bool(has_pose),
+            detection=det if has_pose else None,
         )
 
 
@@ -85,6 +97,8 @@ def gru_cache_status(
     path: Path,
     expected_frame_count: int,
     model_path: Path | None,
+    *,
+    require_player_slots: bool = False,
 ) -> GruCacheStatus:
     if model_path is None or not model_path.is_file():
         return "no_model"
@@ -94,6 +108,8 @@ def gru_cache_status(
         with np.load(path, allow_pickle=False) as data:
             frame_count = int(data["frame_count"])
             cached_model = str(data["model_path"])
+            if require_player_slots and data["labels"].ndim != 2:
+                return "stale"
     except (OSError, KeyError, TypeError, ValueError):
         return "missing"
     if cached_model != _model_cache_key(model_path):
@@ -128,6 +144,7 @@ def save_gru_inferences(path: Path, store: GruInferenceStore) -> None:
     tmp = path.with_name(f"{path.stem}.tmp{path.suffix}")
     np.savez_compressed(
         tmp,
+        layout="stereo_players_v2" if store.labels.ndim == 2 else "mono",
         frame_count=store.frame_count,
         model_path=store.model_path,
         labels=store.labels,
@@ -160,11 +177,15 @@ def _features_from_mono_yolo(store: MonoYoloInferenceStore) -> np.ndarray:
 
 
 def _features_from_stereo_yolo(store: StereoYoloInferenceStore) -> np.ndarray:
-    features = np.full((store.frame_count, 4), np.nan, dtype=np.float32)
+    features = np.full((store.frame_count, 2, 4), np.nan, dtype=np.float32)
     for frame_index in range(store.frame_count):
-        detection = store.detection("left", frame_index)
-        if detection is not None:
-            features[frame_index] = features_from_detection(detection)
+        for slot, player_side in enumerate(("left", "right")):
+            detection = store.detection("left", frame_index, player_side=player_side)
+            if detection is not None:
+                features[frame_index, slot] = features_from_detection(
+                    detection,
+                    mirror_x=player_side == "left",
+                )
     return features
 
 
@@ -236,6 +257,40 @@ def _run_gru_on_features(
     )
 
 
+def _run_stereo_gru_on_features(
+    features: np.ndarray,
+    *,
+    model_path: Path,
+    batch_size: int = GRU_BATCH_SIZE,
+    progress: GruProgressCallback | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> GruInferenceStore:
+    """Run independent GRU streams for left/right main-camera player slots."""
+    if features.ndim != 3 or features.shape[1:] != (2, 4):
+        raise ValueError("Expected stereo player features shaped (frames, 2, 4)")
+
+    stores: list[GruInferenceStore] = []
+    for slot in range(2):
+        slot_progress = progress if slot == 1 else None
+        stores.append(
+            _run_gru_on_features(
+                features[:, slot],
+                model_path=model_path,
+                batch_size=batch_size,
+                progress=slot_progress,
+                cancel_check=cancel_check,
+            )
+        )
+    return GruInferenceStore(
+        frame_count=features.shape[0],
+        model_path=_model_cache_key(model_path),
+        labels=np.stack([store.labels for store in stores], axis=1),
+        logits=np.stack([store.logits for store in stores], axis=1),
+        probabilities=np.stack([store.probabilities for store in stores], axis=1),
+        has_pose=np.stack([store.has_pose for store in stores], axis=1),
+    )
+
+
 def run_mono_gru_inference_phase(
     *,
     yolo_store: MonoYoloInferenceStore,
@@ -267,7 +322,7 @@ def run_stereo_gru_inference_phase(
     cancel_check: Callable[[], bool] | None = None,
 ) -> GruInferenceStore:
     features = _features_from_stereo_yolo(yolo_store)
-    store = _run_gru_on_features(
+    store = _run_stereo_gru_on_features(
         features,
         model_path=model_path,
         batch_size=batch_size,
@@ -294,7 +349,26 @@ def populate_stereo_gru_cache(
     gru_store: GruInferenceStore,
     cache: PlaybackCache,
 ) -> None:
-    populate_mono_gru_cache(gru_store, cache.main)
+    for frame_index in range(gru_store.frame_count):
+        for player_side in ("left", "right"):
+            detection = (
+                cache.main.get_player_pose(player_side, frame_index)
+                if cache.main.has_player_pose(player_side, frame_index)
+                else None
+            )
+            cache.main.put_player_gru(
+                player_side,
+                frame_index,
+                gru_store.prediction(
+                    frame_index,
+                    detection=detection,
+                    player_side=player_side,
+                ),
+            )
+        cache.main.put_gru(
+            frame_index,
+            cache.main.get_player_gru("right", frame_index),
+        )
 
 
 def populate_mono_gru_cache_with_yolo(
@@ -318,12 +392,21 @@ def populate_stereo_gru_cache_with_yolo(
     cache: PlaybackCache,
 ) -> None:
     for frame_index in range(gru_store.frame_count):
+        for player_side in ("left", "right"):
+            cache.main.put_player_gru(
+                player_side,
+                frame_index,
+                gru_store.prediction(
+                    frame_index,
+                    detection=yolo_store.detection(
+                        "left", frame_index, player_side=player_side
+                    ),
+                    player_side=player_side,
+                ),
+            )
         cache.main.put_gru(
             frame_index,
-            gru_store.prediction(
-                frame_index,
-                detection=yolo_store.detection("left", frame_index),
-            ),
+            cache.main.get_player_gru("right", frame_index),
         )
 
 
@@ -335,7 +418,15 @@ def try_load_gru_cache(
     *,
     layout: Literal["mono", "stereo"],
 ) -> bool:
-    if gru_cache_status(path, expected_frame_count, model_path) != "ready":
+    if (
+        gru_cache_status(
+            path,
+            expected_frame_count,
+            model_path,
+            require_player_slots=layout == "stereo",
+        )
+        != "ready"
+    ):
         return False
     gru_store = load_gru_inferences(path)
     if layout == "mono":

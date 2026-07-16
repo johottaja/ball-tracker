@@ -37,6 +37,23 @@ uv run python video_viewer/viewer.py
 uv run python -m training_recorder
 ```
 
+## Two-player game tracking
+
+`game_tracker` processes one active throw at a time from either half of the main
+(left) camera. The player in the main image's left half is mirrored only in the
+GRU's normalized horizontal arm features, allowing the existing right-side throw
+model to classify both directions. Its ball-search sector is mirrored in image
+space; recorded image coordinates and reconstructed 3D geometry are not.
+
+Calibration automatically determines whether the secondary camera sees the same
+player on its left or right by comparing the cameras' calibrated projection
+orientations. The game JSON records each accepted throw's `thrower_side`; the
+3D visualizer renders main-camera-left throws in blue and preserves red for
+right-side and older throws.
+
+Reprocess recordings after upgrading: the pose and GRU cache formats now retain
+separate left/right player slots, so older single-player caches are regenerated.
+
 ## Using the training recorder
 
 - Enter a **Training set** name (e.g. `throws_v1`). Clips for the same name are saved together.

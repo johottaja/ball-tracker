@@ -6,6 +6,8 @@ from .detector import (
     dominant_hand_detection_from_keypoints,
     select_dominant_hand,
     select_dominant_hand_detection,
+    select_player_slot_detections,
+    select_person_hand_detection,
     torso_scale,
     torso_segment,
 )
@@ -18,6 +20,7 @@ from .types import (
     HandSide,
     Joint,
     NormalizedDominantHandSequence,
+    PlayerSide,
 )
 
 __all__ = [
@@ -28,6 +31,7 @@ __all__ = [
     "JOINT_NAMES",
     "Joint",
     "NormalizedDominantHandSequence",
+    "PlayerSide",
     "POSE_CONF_THRESHOLD",
     "POSE_KEYPOINT_MIN_CONF",
     "POSE_MODEL_PATH",
@@ -40,6 +44,8 @@ __all__ = [
     "normalize_hand_keypoints",
     "select_dominant_hand",
     "select_dominant_hand_detection",
+    "select_player_slot_detections",
+    "select_person_hand_detection",
     "torso_scale",
     "torso_segment",
 ]

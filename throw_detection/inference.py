@@ -45,13 +45,17 @@ def default_throw_model_path() -> Path | None:
     return models[0] if models else None
 
 
-def features_from_detection(detection: DominantHandDetection | None) -> np.ndarray:
+def features_from_detection(
+    detection: DominantHandDetection | None,
+    *,
+    mirror_x: bool = False,
+) -> np.ndarray:
     """Elbow and wrist normalized x,y — shape (4,), NaN when pose is missing."""
     features = np.full(4, np.nan, dtype=np.float32)
     if detection is None:
         return features
 
-    normalized, _, _ = normalize_hand_keypoints(detection)
+    normalized, _, _ = normalize_hand_keypoints(detection, mirror_x=mirror_x)
     features[0:2] = normalized[1, :2]
     features[2:4] = normalized[2, :2]
     return features
@@ -61,9 +65,10 @@ def features_from_frame(
     frame: np.ndarray,
     *,
     detector: PoseDetector | None = None,
+    mirror_x: bool = False,
 ) -> tuple[np.ndarray, DominantHandDetection | None]:
     detection = detect_dominant_hand_detection(frame, detector=detector)
-    return features_from_detection(detection), detection
+    return features_from_detection(detection, mirror_x=mirror_x), detection
 
 
 def _build_window(features_history: Sequence[np.ndarray], buffer_size: int) -> np.ndarray:
@@ -87,12 +92,14 @@ class ThrowInference:
         *,
         detector: PoseDetector | None = None,
         map_location: str | torch.device = "cpu",
+        mirror_x: bool = False,
     ) -> None:
         self.model_path = model_path
         self.model, metadata = load_throw_model(model_path, map_location=map_location)
         self.buffer_size = int(metadata["buffer_size"])
         self.metadata = metadata
         self.detector = detector or PoseDetector()
+        self.mirror_x = mirror_x
         self._feature_history: deque[np.ndarray] = deque(maxlen=self.buffer_size)
 
     def reset(self) -> None:
@@ -114,9 +121,13 @@ class ThrowInference:
                 cache=cache,
                 frame_index=frame_index,
             )
-            features = features_from_detection(detection)
+            features = features_from_detection(detection, mirror_x=self.mirror_x)
         else:
-            features, detection = features_from_frame(frame, detector=self.detector)
+            features, detection = features_from_frame(
+                frame,
+                detector=self.detector,
+                mirror_x=self.mirror_x,
+            )
         self._feature_history.append(features)
         return features, detection
 
@@ -125,8 +136,39 @@ class ThrowInference:
         self.reset()
         for index in range(start, frame_index):
             if cache.has_pose(index):
-                features = features_from_detection(cache.get_pose(index))
+                features = features_from_detection(
+                    cache.get_pose(index),
+                    mirror_x=self.mirror_x,
+                )
                 self._feature_history.append(features)
+
+    def predict_from_detection(
+        self,
+        detection: DominantHandDetection | None,
+    ) -> ThrowPrediction:
+        """Classify an already-selected pose without invoking YOLO again."""
+        features = features_from_detection(detection, mirror_x=self.mirror_x)
+        self._feature_history.append(features)
+        if detection is None:
+            return ThrowPrediction(
+                label=0,
+                logit=0.0,
+                probability=0.0,
+                has_pose=False,
+                detection=None,
+            )
+
+        window = _build_window(self._feature_history, self.buffer_size)
+        with torch.no_grad():
+            logit = self.model(torch.from_numpy(window)).item()
+        probability = float(torch.sigmoid(torch.tensor(logit)).item())
+        return ThrowPrediction(
+            label=1 if probability >= 0.75 else 0,
+            logit=logit,
+            probability=probability,
+            has_pose=True,
+            detection=detection,
+        )
 
     def predict(
         self,
@@ -160,32 +202,20 @@ class ThrowInference:
             cache=cache,
             frame_index=frame_index,
         )
-        has_pose = detection is not None
-        if not has_pose:
+        if detection is None:
+            prediction = ThrowPrediction(0, 0.0, 0.0, False, None)
+        else:
+            window = _build_window(self._feature_history, self.buffer_size)
+            with torch.no_grad():
+                logit = self.model(torch.from_numpy(window)).item()
+            probability = float(torch.sigmoid(torch.tensor(logit)).item())
             prediction = ThrowPrediction(
-                label=0,
-                logit=0.0,
-                probability=0.0,
-                has_pose=False,
-                detection=None,
+                label=1 if probability >= 0.75 else 0,
+                logit=logit,
+                probability=probability,
+                has_pose=True,
+                detection=detection,
             )
-            if cache is not None and frame_index is not None:
-                cache.put_gru(frame_index, prediction)
-            return prediction
-
-        window = _build_window(self._feature_history, self.buffer_size)
-        with torch.no_grad():
-            logit = self.model(torch.from_numpy(window)).item()
-
-        probability = float(torch.sigmoid(torch.tensor(logit)).item())
-        label = 1 if probability >= 0.75 else 0
-        prediction = ThrowPrediction(
-            label=label,
-            logit=logit,
-            probability=probability,
-            has_pose=True,
-            detection=detection,
-        )
         if cache is not None and frame_index is not None:
             cache.put_gru(frame_index, prediction)
         return prediction

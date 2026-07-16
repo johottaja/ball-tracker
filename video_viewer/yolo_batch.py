@@ -13,8 +13,9 @@ from pose_detection import (
     PoseDetector,
     dominant_hand_detection_from_keypoints,
     select_dominant_hand_detection,
+    select_player_slot_detections,
 )
-from pose_detection.types import HandSide
+from pose_detection.types import HandSide, PlayerSide
 from video_viewer.config import YOLO_BATCH_SIZE
 from video_viewer.playback_cache import PlaybackCache, StreamPlaybackCache
 from video_viewer.stereo_playback import StereoFrameReader
@@ -78,18 +79,25 @@ class MonoYoloInferenceStore:
 @dataclass(frozen=True)
 class StereoYoloInferenceStore:
     frame_count: int
-    left_person_keypoints: np.ndarray
-    left_sides: np.ndarray
-    right_person_keypoints: np.ndarray
-    right_sides: np.ndarray
+    left_player_keypoints: np.ndarray
+    left_player_sides: np.ndarray
+    right_player_keypoints: np.ndarray
+    right_player_sides: np.ndarray
 
-    def detection(self, camera: str, frame_index: int) -> DominantHandDetection | None:
+    def detection(
+        self,
+        camera: str,
+        frame_index: int,
+        *,
+        player_side: PlayerSide = "right",
+    ) -> DominantHandDetection | None:
+        slot = 0 if player_side == "left" else 1
         if camera == "left":
-            person_keypoints = self.left_person_keypoints[frame_index]
-            side = _int_to_side(int(self.left_sides[frame_index]))
+            person_keypoints = self.left_player_keypoints[frame_index, slot]
+            side = _int_to_side(int(self.left_player_sides[frame_index, slot]))
         else:
-            person_keypoints = self.right_person_keypoints[frame_index]
-            side = _int_to_side(int(self.right_sides[frame_index]))
+            person_keypoints = self.right_player_keypoints[frame_index, slot]
+            side = _int_to_side(int(self.right_player_sides[frame_index, slot]))
         if side is None or np.isnan(person_keypoints).all():
             return None
         return dominant_hand_detection_from_keypoints(person_keypoints, side)
@@ -107,6 +115,14 @@ def _empty_sides_array(count: int) -> np.ndarray:
     return np.full(count, -1, dtype=np.int8)
 
 
+def _empty_player_array(count: int) -> np.ndarray:
+    return np.full((count, 2, 17, 3), np.nan, dtype=np.float32)
+
+
+def _empty_player_sides_array(count: int) -> np.ndarray:
+    return np.full((count, 2), -1, dtype=np.int8)
+
+
 def _layout_from_npz(data: np.lib.npyio.NpzFile) -> YoloCacheLayout | None:
     if "layout" in data:
         layout = str(data["layout"])
@@ -114,6 +130,8 @@ def _layout_from_npz(data: np.lib.npyio.NpzFile) -> YoloCacheLayout | None:
             return layout  # type: ignore[return-value]
     if "person_keypoints" in data:
         return "mono"
+    if "left_player_keypoints" in data:
+        return "stereo"
     if "left_person_keypoints" in data:
         return "stereo"
     return None
@@ -133,6 +151,8 @@ def yolo_cache_status(
                 return "missing"
             if file_layout != layout:
                 return "wrong_layout"
+            if layout == "stereo" and "left_player_keypoints" not in data:
+                return "stale"
             frame_count = int(data["frame_count"])
     except (OSError, KeyError, TypeError, ValueError):
         return "missing"
@@ -177,12 +197,12 @@ def save_stereo_yolo_inferences(path: Path, store: StereoYoloInferenceStore) -> 
     tmp = path.with_name(f"{path.stem}.tmp{path.suffix}")
     np.savez_compressed(
         tmp,
-        layout="stereo",
+        layout="stereo_players_v2",
         frame_count=store.frame_count,
-        left_person_keypoints=store.left_person_keypoints,
-        left_sides=store.left_sides,
-        right_person_keypoints=store.right_person_keypoints,
-        right_sides=store.right_sides,
+        left_player_keypoints=store.left_player_keypoints,
+        left_player_sides=store.left_player_sides,
+        right_player_keypoints=store.right_player_keypoints,
+        right_player_sides=store.right_player_sides,
     )
     tmp.replace(path)
 
@@ -206,12 +226,14 @@ def load_stereo_yolo_inferences(path: Path) -> StereoYoloInferenceStore:
     with np.load(path, allow_pickle=False) as data:
         if _layout_from_npz(data) != "stereo":
             raise ValueError(f"Expected stereo YOLO cache at {path}")
+        if "left_player_keypoints" not in data:
+            raise ValueError(f"Legacy single-player YOLO cache at {path}; re-run preprocess")
         return StereoYoloInferenceStore(
             frame_count=int(data["frame_count"]),
-            left_person_keypoints=data["left_person_keypoints"],
-            left_sides=data["left_sides"],
-            right_person_keypoints=data["right_person_keypoints"],
-            right_sides=data["right_sides"],
+            left_player_keypoints=data["left_player_keypoints"],
+            left_player_sides=data["left_player_sides"],
+            right_player_keypoints=data["right_player_keypoints"],
+            right_player_sides=data["right_player_sides"],
         )
 
 
@@ -226,8 +248,26 @@ def populate_mono_pose_cache(store: MonoYoloInferenceStore, cache: StreamPlaybac
 
 def populate_stereo_pose_cache(store: StereoYoloInferenceStore, cache: PlaybackCache) -> None:
     for frame_index in range(store.frame_count):
-        cache.main.put_pose(frame_index, store.detection("left", frame_index))
-        cache.secondary.put_pose(frame_index, store.detection("right", frame_index))
+        for player_side in ("left", "right"):
+            cache.main.put_player_pose(
+                player_side,
+                frame_index,
+                store.detection("left", frame_index, player_side=player_side),
+            )
+            cache.secondary.put_player_pose(
+                player_side,
+                frame_index,
+                store.detection("right", frame_index, player_side=player_side),
+            )
+        # Preserve the historical singular-cache contract for existing viewers.
+        cache.main.put_pose(
+            frame_index,
+            store.detection("left", frame_index, player_side="right"),
+        )
+        cache.secondary.put_pose(
+            frame_index,
+            store.detection("right", frame_index, player_side="right"),
+        )
 
 
 def populate_pose_cache(store: StereoYoloInferenceStore, cache: PlaybackCache) -> None:
@@ -368,10 +408,10 @@ def run_stereo_yolo_inference_phase(
         fps=fps,
     )
 
-    left_person = _empty_person_array(total)
-    left_sides = _empty_sides_array(total)
-    right_person = _empty_person_array(total)
-    right_sides = _empty_sides_array(total)
+    left_players = _empty_player_array(total)
+    left_player_sides = _empty_player_sides_array(total)
+    right_players = _empty_player_array(total)
+    right_player_sides = _empty_player_sides_array(total)
 
     detector = PoseDetector()
     start = time.monotonic()
@@ -401,14 +441,17 @@ def run_stereo_yolo_inference_phase(
                 zip(left_frames, right_frames, left_batch, right_batch)
             ):
                 frame_index = batch_start + offset
-                left_detection = select_dominant_hand_detection(left_frame, left_people)
-                right_detection = select_dominant_hand_detection(right_frame, right_people)
-                left_person[frame_index], left_sides[frame_index] = _detection_to_row(
-                    left_detection
-                )
-                right_person[frame_index], right_sides[frame_index] = _detection_to_row(
-                    right_detection
-                )
+                left_detections = select_player_slot_detections(left_frame, left_people)
+                right_detections = select_player_slot_detections(right_frame, right_people)
+                for slot, player_side in enumerate(("left", "right")):
+                    (
+                        left_players[frame_index, slot],
+                        left_player_sides[frame_index, slot],
+                    ) = _detection_to_row(left_detections[player_side])
+                    (
+                        right_players[frame_index, slot],
+                        right_player_sides[frame_index, slot],
+                    ) = _detection_to_row(right_detections[player_side])
 
                 if progress is not None:
                     progress(
@@ -423,10 +466,10 @@ def run_stereo_yolo_inference_phase(
 
     store = StereoYoloInferenceStore(
         frame_count=total,
-        left_person_keypoints=left_person,
-        left_sides=left_sides,
-        right_person_keypoints=right_person,
-        right_sides=right_sides,
+        left_player_keypoints=left_players,
+        left_player_sides=left_player_sides,
+        right_player_keypoints=right_players,
+        right_player_sides=right_player_sides,
     )
     save_stereo_yolo_inferences(output_path, store)
     return store

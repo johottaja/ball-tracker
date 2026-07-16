@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 
@@ -13,6 +14,15 @@ from .types import (
 )
 
 _CAMERA_COLORS = {"left": "#cc2222", "right": "#2255cc"}
+ScreenSide = Literal["left", "right"]
+
+
+@dataclass(frozen=True)
+class StereoScreenSideMapping:
+    """How main-camera image halves correspond to secondary image halves."""
+
+    main_left_to_secondary: ScreenSide
+    horizontal_axis_dot: float
 
 
 @dataclass(frozen=True)
@@ -58,6 +68,72 @@ def _image_ray_direction(projection: np.ndarray, u: float, v: float) -> np.ndarr
     if norm < 1e-9:
         return None
     return direction / norm
+
+
+def _image_right_world_axis(projection: np.ndarray) -> np.ndarray | None:
+    """Camera image-right unit vector expressed in world coordinates."""
+    matrix = projection[:, :3]
+    if matrix.shape != (3, 3) or abs(np.linalg.det(matrix)) < 1e-9:
+        return None
+    axis = np.linalg.inv(matrix) @ np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    norm = np.linalg.norm(axis)
+    return axis / norm if norm >= 1e-9 else None
+
+
+def infer_stereo_screen_side_mapping(
+    calibration: TableCalibration,
+    *,
+    ambiguity_threshold: float = 0.25,
+) -> StereoScreenSideMapping | None:
+    """
+    Infer whether image-left in the main camera is left or right in the secondary.
+
+    P = K[R|t] maps the camera's local +X (image-right) direction into world
+    space through the inverse 3×3 camera matrix. Aligned right axes preserve
+    screen sides; opposed axes reverse them. Nearly perpendicular axes cannot
+    reliably map two image halves and are rejected.
+    """
+    main = calibration.camera("left")
+    secondary = calibration.camera("right")
+    if main is None or secondary is None:
+        return None
+    main_axis = _image_right_world_axis(main.projection_matrix)
+    secondary_axis = _image_right_world_axis(secondary.projection_matrix)
+    if main_axis is None or secondary_axis is None:
+        return None
+    dot = float(np.dot(main_axis, secondary_axis))
+    if abs(dot) < ambiguity_threshold:
+        return None
+    table_axis = np.array([main_axis[0], main_axis[1]], dtype=np.float64)
+    table_norm = np.linalg.norm(table_axis)
+    if table_norm < 1e-9:
+        return None
+    table_axis /= table_norm
+    distance = min(calibration.table_length_m, calibration.table_width_m) * 0.25
+
+    def projected_u(projection: np.ndarray, sign: float) -> float | None:
+        world = np.array(
+            [sign * distance * table_axis[0], sign * distance * table_axis[1], 0.0, 1.0],
+            dtype=np.float64,
+        )
+        image = projection @ world
+        if abs(image[2]) < 1e-9:
+            return None
+        return float(image[0] / image[2])
+
+    main_delta = projected_u(main.projection_matrix, 1.0)
+    main_origin = projected_u(main.projection_matrix, -1.0)
+    secondary_delta = projected_u(secondary.projection_matrix, 1.0)
+    secondary_origin = projected_u(secondary.projection_matrix, -1.0)
+    if None in (main_delta, main_origin, secondary_delta, secondary_origin):
+        return None
+    projected_dot = (main_delta - main_origin) * (secondary_delta - secondary_origin)
+    if abs(projected_dot) < 1e-9 or (projected_dot > 0) != (dot > 0):
+        return None
+    return StereoScreenSideMapping(
+        main_left_to_secondary="left" if dot > 0 else "right",
+        horizontal_axis_dot=dot,
+    )
 
 
 def _ray_table_xy_intersection(

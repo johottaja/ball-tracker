@@ -10,7 +10,13 @@ from .config import (
     POSE_KEYPOINT_MIN_CONF,
     POSE_MODEL_PATH,
 )
-from .types import DominantHand, DominantHandDetection, HandSide, Joint
+from .types import (
+    DominantHand,
+    DominantHandDetection,
+    HandSide,
+    Joint,
+    PlayerSide,
+)
 
 # COCO pose indices for each arm (shoulder → elbow → wrist).
 _HAND_JOINTS: dict[HandSide, tuple[tuple[str, int], ...]] = {
@@ -156,6 +162,83 @@ def _wrist_distance_to_center(joints: tuple[Joint, ...], center: tuple[float, fl
     return (wrist.x - center[0]) ** 2 + (wrist.y - center[1]) ** 2
 
 
+def _person_x_center(person_keypoints: np.ndarray) -> float | None:
+    """Return a stable torso-based horizontal position for a detected person."""
+    torso_indices = (5, 6, 11, 12)
+    xs = [
+        float(person_keypoints[index, 0])
+        for index in torso_indices
+        if person_keypoints[index, 2] >= POSE_KEYPOINT_MIN_CONF
+    ]
+    if xs:
+        return float(np.mean(xs))
+    visible_xs = person_keypoints[
+        person_keypoints[:, 2] >= POSE_KEYPOINT_MIN_CONF, 0
+    ]
+    return float(np.mean(visible_xs)) if len(visible_xs) else None
+
+
+def select_person_hand_detection(
+    frame: np.ndarray,
+    person_keypoints: np.ndarray,
+) -> DominantHandDetection | None:
+    """Choose one valid arm for one person using the existing center preference."""
+    center = _frame_center(frame)
+    best_hand: DominantHand | None = None
+    best_distance = float("inf")
+    for side in ("left", "right"):
+        joints = _hand_joints(person_keypoints, side)
+        if joints is None:
+            continue
+        distance = _wrist_distance_to_center(joints, center)
+        if distance < best_distance:
+            best_distance = distance
+            best_hand = DominantHand(side=side, joints=joints)
+    if best_hand is None:
+        return None
+    return DominantHandDetection(hand=best_hand, person_keypoints=person_keypoints)
+
+
+def select_player_slot_detections(
+    frame: np.ndarray,
+    all_keypoints: list[np.ndarray],
+) -> dict[PlayerSide, DominantHandDetection | None]:
+    """
+    Select at most one valid pose per main-image half.
+
+    The outermost person is chosen when multiple valid people occupy a half. This
+    keeps the two fixed beer-pong player slots stable and avoids treating a
+    bystander between them as either player.
+    """
+    width = frame.shape[1]
+    candidates: dict[PlayerSide, list[tuple[float, DominantHandDetection]]] = {
+        "left": [],
+        "right": [],
+    }
+    for person_keypoints in all_keypoints:
+        detection = select_person_hand_detection(frame, person_keypoints)
+        if detection is None:
+            continue
+        person_x = _person_x_center(person_keypoints)
+        if person_x is None:
+            continue
+        player_side: PlayerSide = "left" if person_x < width / 2 else "right"
+        candidates[player_side].append((person_x, detection))
+
+    return {
+        "left": (
+            min(candidates["left"], key=lambda item: item[0])[1]
+            if candidates["left"]
+            else None
+        ),
+        "right": (
+            max(candidates["right"], key=lambda item: item[0])[1]
+            if candidates["right"]
+            else None
+        ),
+    }
+
+
 def torso_segment(detection: DominantHandDetection) -> tuple[Joint, Joint] | None:
     """Dominant-side shoulder and hip joints in image coordinates."""
     side = detection.hand.side
@@ -200,15 +283,14 @@ def select_dominant_hand_detection(
     best_distance = float("inf")
 
     for person_keypoints in all_keypoints:
-        for side in ("left", "right"):
-            joints = _hand_joints(person_keypoints, side)
-            if joints is None:
-                continue
-            distance = _wrist_distance_to_center(joints, center)
-            if distance < best_distance:
-                best_distance = distance
-                best_hand = DominantHand(side=side, joints=joints)
-                best_person_keypoints = person_keypoints
+        detection = select_person_hand_detection(frame, person_keypoints)
+        if detection is None:
+            continue
+        distance = _wrist_distance_to_center(detection.hand.joints, center)
+        if distance < best_distance:
+            best_distance = distance
+            best_hand = detection.hand
+            best_person_keypoints = person_keypoints
 
     if best_hand is None or best_person_keypoints is None:
         return None

@@ -311,12 +311,24 @@ def find_release_point_from_cache(
     track: Sequence[FramePointLike],
     fit: ParabolaFit | None,
     cache: object,
+    *,
+    player_side: str | None = None,
 ) -> ReleasePoint | None:
+    def pose_at(frame: int) -> DominantHandDetection | None:
+        if player_side is not None and cache.has_player_pose(player_side, frame):
+            return cache.get_player_pose(player_side, frame)
+        return _pose_at_from_cache(cache, frame)
+
+    def throw_label_at(frame: int) -> int:
+        if player_side is not None and cache.has_player_gru(player_side, frame):
+            return cache.get_player_gru(player_side, frame).label
+        return _throw_label_at_from_cache(cache, frame)
+
     return find_release_point(
         track,
         fit,
-        pose_at=lambda frame: _pose_at_from_cache(cache, frame),
-        throw_label_at=lambda frame: _throw_label_at_from_cache(cache, frame),
+        pose_at=pose_at,
+        throw_label_at=throw_label_at,
     )
 
 

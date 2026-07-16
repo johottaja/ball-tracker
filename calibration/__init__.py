@@ -17,7 +17,9 @@ from .layout import (
     compute_calibration_layout,
     compute_camera_layout,
     compute_stereo_layout_stats,
+    infer_stereo_screen_side_mapping,
     layout_info_from_calibration,
+    StereoScreenSideMapping,
 )
 from .layout_dialog import CameraLayoutDialog
 from .storage import attach_layout_stats, load_calibration, save_calibration
@@ -36,6 +38,7 @@ __all__ = [
     "CameraLayoutInfo",
     "CameraLayoutStats",
     "StereoLayoutStats",
+    "StereoScreenSideMapping",
     "TableCalibration",
     "TableCalibrationDialog",
     "attach_layout_stats",
@@ -48,6 +51,7 @@ __all__ = [
     "estimate_focal_length",
     "focal_length_from_horizontal_fov",
     "image_to_table_plane",
+    "infer_stereo_screen_side_mapping",
     "intrinsic_matrix_from_focal_length",
     "intrinsic_matrix_from_homography",
     "layout_info_from_calibration",

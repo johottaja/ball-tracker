@@ -132,6 +132,10 @@ class TrajectoryTracker:
         self._stereo_reconcile = False
         self._awaiting_valid_completion = False
 
+    def set_sector_direction_deg(self, direction_deg: float) -> None:
+        """Set the fixed sector direction for the currently selected player."""
+        self._sector_direction_deg = direction_deg % 360.0
+
     def exit_awaiting_partner(self) -> None:
         """Leave AWAITING_PARTNER and return to throw detection."""
         self.phase = Phase.DETECTING_THROW
