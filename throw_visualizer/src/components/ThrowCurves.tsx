@@ -1,6 +1,6 @@
 import { useMemo } from 'react'
 import * as THREE from 'three'
-import type { ThrowRecord } from '../types'
+import type { CurveFitMode, ThrowRecord } from '../types'
 import { extendCurveToTable, gamePointsToThree } from '../coordinates'
 import { THROW_POINT_COLOR, throwCurveColor } from '../colors'
 
@@ -10,6 +10,20 @@ const POINT_RADIUS = 0.014
 interface ThrowCurvesProps {
   throws: ThrowRecord[]
   selectedThrowId: number | null
+  curveFit: CurveFitMode
+}
+
+function curvePointsForThrow(throwRecord: ThrowRecord, curveFit: CurveFitMode) {
+  if (curveFit === 'ballistic') {
+    const ballistic = throwRecord.ballistic_curve_3d
+    if (ballistic && ballistic.length >= 2) {
+      return ballistic
+    }
+  }
+  if (throwRecord.fitted_curve_3d.length >= 2) {
+    return throwRecord.fitted_curve_3d
+  }
+  return throwRecord.points_3d
 }
 
 function ThrowCurve({ points, color }: { points: THREE.Vector3[]; color: string }) {
@@ -49,7 +63,7 @@ function ThrowPoints({ points }: { points: THREE.Vector3[] }) {
   )
 }
 
-export function ThrowCurves({ throws, selectedThrowId }: ThrowCurvesProps) {
+export function ThrowCurves({ throws, selectedThrowId, curveFit }: ThrowCurvesProps) {
   const selectedThrow = selectedThrowId === null
     ? null
     : throws.find((t) => t.id === selectedThrowId) ?? null
@@ -62,8 +76,7 @@ export function ThrowCurves({ throws, selectedThrowId }: ThrowCurvesProps) {
   return (
     <group>
       {throws.map((t) => {
-        const curvePoints =
-          t.fitted_curve_3d.length >= 2 ? t.fitted_curve_3d : t.points_3d
+        const curvePoints = curvePointsForThrow(t, curveFit)
         const points = gamePointsToThree(extendCurveToTable(curvePoints))
 
         if (points.length < 2) {

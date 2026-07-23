@@ -11,6 +11,7 @@ from calibration import TableCalibration
 from video_viewer.stereo_timeline import StereoTimeline
 
 from .config import (
+    GRAVITY_M_S2,
     MAX_TRACK_INTERPOLATION_GAP_S,
     MAX_TRIANGULATION_HEIGHT_M,
     MIN_TRIANGULATION_HEIGHT_M,
@@ -169,6 +170,16 @@ def interpolate_track_at_frame(
     return None
 
 
+def _point_times(points: list[Point3D]) -> np.ndarray:
+    return np.array(
+        [
+            p.time_s if p.time_s is not None else (p.frame if p.frame is not None else i)
+            for i, p in enumerate(points)
+        ],
+        dtype=np.float64,
+    )
+
+
 def _fit_curve_3d(
     points: list[Point3D],
     *,
@@ -177,10 +188,7 @@ def _fit_curve_3d(
     if len(points) < 3:
         return [CurvePoint3D(x=p.x, y=p.y, z=p.z) for p in points]
 
-    parameters = np.array(
-        [p.time_s if p.time_s is not None else (p.frame if p.frame is not None else i) for i, p in enumerate(points)],
-        dtype=np.float64,
-    )
+    parameters = _point_times(points)
     xs = np.array([p.x for p in points], dtype=np.float64)
     ys = np.array([p.y for p in points], dtype=np.float64)
     zs = np.array([p.z for p in points], dtype=np.float64)
@@ -203,6 +211,71 @@ def _fit_curve_3d(
         )
         for t in t_sample
     ]
+
+
+def _fit_ballistic_curve_3d(
+    points: list[Point3D],
+    *,
+    sample_count: int = 120,
+    gravity_m_s2: float = GRAVITY_M_S2,
+) -> tuple[list[CurvePoint3D], float | None]:
+    """Fit fixed-g ballistic motion: x,y linear in t; z quadratic with −½gt².
+
+    Returns sampled curve points over the observed duration and initial speed ‖v₀‖.
+    On failure returns an empty curve and None speed.
+    """
+    if len(points) < 3:
+        return [], None
+
+    times = _point_times(points)
+    t0 = float(times.min())
+    t = times - t0
+    t_end = float(t.max())
+    if t_end <= 0.0:
+        return [], None
+
+    xs = np.array([p.x for p in points], dtype=np.float64)
+    ys = np.array([p.y for p in points], dtype=np.float64)
+    zs = np.array([p.z for p in points], dtype=np.float64)
+    z_adj = zs + 0.5 * gravity_m_s2 * t * t
+
+    # Design matrix columns: [1, t] for each of x, y, z → params
+    # [x0, vx, y0, vy, z0, vz]
+    n = len(points)
+    a = np.zeros((3 * n, 6), dtype=np.float64)
+    b = np.zeros(3 * n, dtype=np.float64)
+    ones = np.ones(n, dtype=np.float64)
+
+    a[0:n, 0] = ones
+    a[0:n, 1] = t
+    b[0:n] = xs
+
+    a[n : 2 * n, 2] = ones
+    a[n : 2 * n, 3] = t
+    b[n : 2 * n] = ys
+
+    a[2 * n : 3 * n, 4] = ones
+    a[2 * n : 3 * n, 5] = t
+    b[2 * n : 3 * n] = z_adj
+
+    try:
+        params, *_ = np.linalg.lstsq(a, b, rcond=None)
+    except np.linalg.LinAlgError:
+        return [], None
+
+    x0, vx, y0, vy, z0, vz = (float(v) for v in params)
+    speed = math.sqrt(vx * vx + vy * vy + vz * vz)
+
+    t_sample = np.linspace(0.0, t_end, sample_count)
+    curve = [
+        CurvePoint3D(
+            x=x0 + vx * float(ti),
+            y=y0 + vy * float(ti),
+            z=z0 + vz * float(ti) - 0.5 * gravity_m_s2 * float(ti) * float(ti),
+        )
+        for ti in t_sample
+    ]
+    return curve, speed
 
 
 def triangulate_throw(
@@ -326,6 +399,7 @@ def triangulate_throw(
     start_frame = min(p.frame for p in left_track if p.frame is not None)
     end_frame = max(p.frame for p in left_track if p.frame is not None)
     fitted = _fit_curve_3d(points_3d)
+    ballistic, ballistic_speed_m_s = _fit_ballistic_curve_3d(points_3d)
 
     point_times = [point.time_s for point in points_3d if point.time_s is not None]
     if len(point_times) >= 2:
@@ -345,6 +419,8 @@ def triangulate_throw(
             points_3d=points_3d,
             fitted_curve_3d=fitted,
             speed_m_s=speed_m_s,
+            ballistic_curve_3d=ballistic,
+            ballistic_speed_m_s=ballistic_speed_m_s,
             tracks_2d={"left": list(left_track), "right": list(right_track)},
             thrower_side=thrower_side,
         )

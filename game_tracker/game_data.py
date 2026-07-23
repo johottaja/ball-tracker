@@ -70,6 +70,12 @@ class ThrowRecord:
     speed_m_s: float | None
     tracks_2d: dict[str, list[Point2D]]
     thrower_side: str = "right"
+    ballistic_curve_3d: list[CurvePoint3D] | None = None
+    ballistic_speed_m_s: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.ballistic_curve_3d is None:
+            self.ballistic_curve_3d = []
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -79,6 +85,8 @@ class ThrowRecord:
             "points_3d": [p.to_dict() for p in self.points_3d],
             "fitted_curve_3d": [p.to_dict() for p in self.fitted_curve_3d],
             "speed_m_s": self.speed_m_s,
+            "ballistic_curve_3d": [p.to_dict() for p in (self.ballistic_curve_3d or [])],
+            "ballistic_speed_m_s": self.ballistic_speed_m_s,
             "thrower_side": self.thrower_side,
             "tracks_2d": {
                 camera: [p.to_dict() for p in points]
@@ -162,6 +170,15 @@ class GameSession:
                         for p in item.get("fitted_curve_3d", [])
                     ],
                     speed_m_s=item.get("speed_m_s"),
+                    ballistic_curve_3d=[
+                        CurvePoint3D(
+                            x=float(p["x"]),
+                            y=float(p["y"]),
+                            z=float(p["z"]),
+                        )
+                        for p in item.get("ballistic_curve_3d", [])
+                    ],
+                    ballistic_speed_m_s=item.get("ballistic_speed_m_s"),
                     tracks_2d=tracks_2d,
                     thrower_side=str(item.get("thrower_side", "right")),
                 )

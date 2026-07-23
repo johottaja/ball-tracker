@@ -273,6 +273,12 @@ class MotionMaskBuilder:
                 frame_index=frame_index,
             )
             mask = combine_hybrid_masks(mog2_mask, frame_diff_mask)
+            if mask is not None:
+                kernel = np.ones(
+                    (MOG2_MORPH_KERNEL_SIZE, MOG2_MORPH_KERNEL_SIZE),
+                    np.uint8,
+                )
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
             if mask is not None and cache is not None and frame_index is not None:
                 cache.put_motion_mask(self._method, frame_index, mask)
             return mask

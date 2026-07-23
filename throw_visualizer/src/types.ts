@@ -4,6 +4,8 @@ export interface CurvePoint3D {
   z: number
 }
 
+export type CurveFitMode = 'quadratic' | 'ballistic'
+
 export interface ThrowRecord {
   id: number
   start_frame: number
@@ -11,6 +13,8 @@ export interface ThrowRecord {
   points_3d: CurvePoint3D[]
   fitted_curve_3d: CurvePoint3D[]
   speed_m_s: number | null
+  ballistic_curve_3d?: CurvePoint3D[]
+  ballistic_speed_m_s?: number | null
   thrower_side?: 'left' | 'right'
 }
 

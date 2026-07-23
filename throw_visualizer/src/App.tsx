@@ -2,7 +2,17 @@ import { useCallback, useEffect, useState } from 'react'
 import { Scene } from './components/Scene'
 import { fetchGame, fetchGameList } from './games'
 import type { GameListEntry } from './games'
-import type { GameSession } from './types'
+import type { CurveFitMode, GameSession } from './types'
+
+function throwSpeedMps(throwRecord: GameSession['throws'][number], curveFit: CurveFitMode) {
+  if (curveFit === 'ballistic') {
+    const ballistic = throwRecord.ballistic_speed_m_s
+    if (ballistic != null) {
+      return ballistic
+    }
+  }
+  return throwRecord.speed_m_s
+}
 
 function App() {
   const [gameList, setGameList] = useState<GameListEntry[]>([])
@@ -13,6 +23,7 @@ function App() {
   const [gameError, setGameError] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [selectedThrowId, setSelectedThrowId] = useState<number | null>(null)
+  const [curveFit, setCurveFit] = useState<CurveFitMode>('quadratic')
 
   const refreshGameList = useCallback(async (selectLatest = false) => {
     setRefreshing(true)
@@ -167,12 +178,29 @@ function App() {
               }}
             >
               <option value="">All throws</option>
-              {activeGame.throws.map((t) => (
-                <option key={t.id} value={t.id}>
-                  Throw {t.id}
-                  {t.speed_m_s !== null ? ` · ${t.speed_m_s.toFixed(1)} m/s` : ''}
-                </option>
-              ))}
+              {activeGame.throws.map((t) => {
+                const speed = throwSpeedMps(t, curveFit)
+                return (
+                  <option key={t.id} value={t.id}>
+                    Throw {t.id}
+                    {speed != null ? ` · ${speed.toFixed(1)} m/s` : ''}
+                  </option>
+                )
+              })}
+            </select>
+          </label>
+        )}
+
+        {activeGame && activeGame.throws.length > 0 && (
+          <label className="flex items-center gap-2 text-sm text-zinc-400">
+            Fit
+            <select
+              className="rounded-md border border-zinc-700 bg-zinc-900 px-2 py-1 text-zinc-100"
+              value={curveFit}
+              onChange={(e) => setCurveFit(e.target.value as CurveFitMode)}
+            >
+              <option value="quadratic">Quadratic</option>
+              <option value="ballistic">Ballistic</option>
             </select>
           </label>
         )}
@@ -197,7 +225,11 @@ function App() {
           </div>
         )}
         {activeGame ? (
-          <Scene game={activeGame} selectedThrowId={selectedThrowId} />
+          <Scene
+            game={activeGame}
+            selectedThrowId={selectedThrowId}
+            curveFit={curveFit}
+          />
         ) : (
           <div className="flex h-full items-center justify-center text-zinc-500">
             No game JSON found. Process a game in game_tracker, then hit Refresh.

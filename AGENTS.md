@@ -19,7 +19,7 @@ Guidance for AI agents working in this repository.
 - **`trajectory_tracking/`** — stateful ball trajectory tracker that combines throw inference with configurable ball motion masks. Three phases: detecting throw → scanning for ball in a circular sector from the wrist → tracking ball frame-by-frame. Fits a parabola to the collected positions and exposes drawing helpers for the video viewer filter.
 - **`framesync/`** — stereo camera frame-offset measurement from deliberate straight-down ball drops and table bounces. Per-camera macro phase machine plus subframe bounce-time estimation; reused by the stereo viewer **Frame sync** filter.
 - **`calibration/`** — shared table-corner calibration UI and homography math. After the four corners are clicked on each camera, **Calibrate** uses MediaPipe Hands to capture a stable index fingertip at each known table corner from the live stereo feed, then refines the camera poses while retaining calibrated intrinsics. It saves `calibration.json` at the repo root (gitignored): table dimensions, calibration frame size, per-camera 3×4 projection matrices, and persisted camera layout stats (positions, angles, FOVs, stereo baseline). MediaPipe's `hand_landmarker.task` is downloaded on first refinement and gitignored. `game_tracker` triangulates 3D throws directly from the saved projection matrices via `cv2.triangulatePoints`; **Camera layout** reads the saved layout stats.
-- **`throw_visualizer/`** — React + Vite + Tailwind + Three.js SPA that loads `game_tracker/games/*.json` (or a user-uploaded file) and renders the calibrated table plus 3D throw curves. Table origin at center, playing surface at Z=0, floor at Z=−0.8 m.
+- **`throw_visualizer/`** — React + Vite + Tailwind + Three.js SPA that loads `game_tracker/games/*.json` (or a user-uploaded file) and renders the calibrated table plus 3D throw curves (quadratic or ballistic fit). Table origin at center, playing surface at Z=0, floor at Z=−0.8 m.
 
 Dual-camera synchronized recording is available via `stereo_viewer` and `game_tracker`. Stereo 3D triangulation and JSON export are implemented in `game_tracker`; the initial React 3D viewer lives in `throw_visualizer/`.
 
@@ -201,7 +201,7 @@ balltracker/
 | `game_tracker/app.py` | `GameTrackerApp` — dual-camera record/playback, ball-detection method, table calibration; **Import from stereo viewer** copies `stereo_viewer/recordings/left.mp4` and `right.mp4` into game tracker recordings |
 | `game_tracker/config.py` | `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `GAME_JSON` |
 | `game_tracker/processor.py` | `GameTrackingProcessor` — stereo GRU + ball tracking, native-capture-time 2D observations, triangulation, incremental `game.json` writes |
-| `game_tracker/triangulation.py` | `cv2.triangulatePoints` from calibration projection matrices; matches tracks at actual per-camera capture times, quadratic 3D curve fit, speed from 3D arc length |
+| `game_tracker/triangulation.py` | `cv2.triangulatePoints` from calibration projection matrices; matches tracks at actual per-camera capture times; free quadratic 3D curve fit (arc-length speed) plus fixed-g ballistic fit (‖v₀‖ speed) |
 | `game_tracker/game_data.py` | `GameSession`, `ThrowRecord`, JSON save/load (atomic temp + rename) |
 | **video_viewer** | |
 | `app.py` | `VideoViewerApp` — modes (record/playback), UI, frame stepping, filter wiring |
@@ -251,7 +251,7 @@ Both viewers expose a **Ball detection** dropdown (independent of the display fi
 
 **Hybrid:** runs MOG2 and frame diff independently; each does its own contour detection. Ball position merges at the detection level — if both find a ball in the search area, MOG2 wins; otherwise either method’s hit is used. Used by trajectory/stereo tracking via `alternate_motion_mask`. **Contours** draws circular contours from both masks on an OR background.
 
-**Hybrid stacked:** bitwise-OR (`cv2.bitwise_or`) of the MOG2 and frame-diff masks, then standard single-mask contour detection. Behaves like one combined motion mask everywhere.
+**Hybrid stacked:** bitwise-OR (`cv2.bitwise_or`) of the MOG2 and frame-diff masks, then morphological close (same kernel as MOG2), then standard single-mask contour detection. Behaves like one combined motion mask everywhere.
 
 Shared contour step (all methods):
 
@@ -336,9 +336,9 @@ Production app for recording a beer pong session and exporting 3D throw trajecto
 
 **Tracking (`GameTrackingProcessor`):** Active during batch processing after record. The main (left) camera arbitrates its two player-slot GRU streams, locks the winning side until tracking completes, and uses that player's wrist plus a horizontally mirrored sector for main-image-left throws. The secondary camera maps that player to its own image side from the calibrated projection rotations, then uses that wrist and its local sector direction. Completion queues pair only same-side, temporally overlapping tracks; failed tracks adopt the partner phase via `trajectory_tracking.stereo.reconcile_stereo_trackers`. Held native frames never advance a camera's GRU or trajectory state. While in `TRACKING_BALL`, each fresh native camera frame becomes a 2D observation tagged with its actual capture time. `triangulate_throw` linearly interpolates the right track at each left observation time (rejecting gaps over 100 ms), triangulates each pair, and fits the 3D curve against capture time.
 
-**3D coordinate system:** Origin at table center; X along table length, Y along width, Z up from table (meters). **Calibrate** saves 3×4 projection matrices per camera (derived from corner clicks + focal-length estimation at save time). Per-point triangulation via `cv2.triangulatePoints` on temporally aligned 2D pairs (`secondary_frame = main_frame + offset` when offset is known). Video frame size must match the calibration frame size. 3D speed from fitted curve arc length ÷ throw duration. Requires `calibration.json` at repo root (saved via **Calibrate**).
+**3D coordinate system:** Origin at table center; X along table length, Y along width, Z up from table (meters). **Calibrate** saves 3×4 projection matrices per camera (derived from corner clicks + focal-length estimation at save time). Per-point triangulation via `cv2.triangulatePoints` on temporally aligned 2D pairs (`secondary_frame = main_frame + offset` when offset is known). Video frame size must match the calibration frame size. After triangulation, each throw gets two fits over the observed duration: a free parametric quadratic (`fitted_curve_3d`, speed from curve arc length ÷ duration) and a fixed-g ballistic trajectory (`ballistic_curve_3d`, `ballistic_speed_m_s` = ‖v₀‖ with g = 9.81). Requires `calibration.json` at repo root (saved via **Calibrate**).
 
-**`game.json` schema (version 1):** `recorded_at`, `fps`, `frame_count`, `videos`, `coordinate_system`, optional `calibration` (full `calibration.json` snapshot including `layout` stats, written at process time), `throws[]` with `id`, `start_frame`, `end_frame`, `points_3d`, `fitted_curve_3d`, `speed_m_s`, `tracks_2d` (left/right pixel tracks, with optional native-camera `time_s`), and `thrower_side` (`left`/`right` in main-camera image space). The visualizer renders `left` throws blue and retains its existing red palette for `right` or legacy throws.
+**`game.json` schema (version 1):** `recorded_at`, `fps`, `frame_count`, `videos`, `coordinate_system`, optional `calibration` (full `calibration.json` snapshot including `layout` stats, written at process time), `throws[]` with `id`, `start_frame`, `end_frame`, `points_3d`, `fitted_curve_3d`, `speed_m_s`, `ballistic_curve_3d`, `ballistic_speed_m_s`, `tracks_2d` (left/right pixel tracks, with optional native-camera `time_s`), and `thrower_side` (`left`/`right` in main-camera image space). The visualizer renders `left` throws blue and retains its existing red palette for `right` or legacy throws; a **Fit** selector chooses quadratic vs ballistic curves (falls back to quadratic when ballistic data is missing).
 
 ## Frame sync (`framesync`)
 
@@ -376,7 +376,7 @@ Tune via `framesync/config.py`: `DROP_STREAK_FRAMES`, `MAX_HORIZONTAL_DELTA_PX`,
 **`game_tracker/config.py`**
 
 - **Paths:** `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `GAME_JSON`
-- **Triangulation:** `MIN_TRIANGULATION_HEIGHT_M`, `MAX_TRIANGULATION_HEIGHT_M`
+- **Triangulation:** `MIN_TRIANGULATION_HEIGHT_M`, `MAX_TRIANGULATION_HEIGHT_M`, `MAX_TRACK_INTERPOLATION_GAP_S`, `GRAVITY_M_S2` (ballistic fit, default 9.81)
 
 **`pose_detection/config.py`**
 
