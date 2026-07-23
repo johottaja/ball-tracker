@@ -326,7 +326,13 @@ def _paired_slots(
             event_time = right_time
             right_pos += 1
         if event_time <= master_times[-1]:
-            raise ValueError("Capture events must yield strictly increasing master times")
+            # The first slot of a near-synchronous pair is dated by its later
+            # capture.  If the faster camera supplied another frame before
+            # that later capture, its event belongs to that same master
+            # instant; emitting it as a new slot would make time go backwards.
+            left_indices[-1] = next_left
+            right_indices[-1] = next_right
+            continue
         left_indices.append(next_left)
         right_indices.append(next_right)
         master_times.append(event_time)
