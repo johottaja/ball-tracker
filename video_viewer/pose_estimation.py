@@ -86,6 +86,7 @@ class PoseEstimationPanel:
         self._left_video: Path | None = None
         self._right_video: Path | None = None
         self._fps = 30.0
+        self._timeline_signature: str | None = None
 
         self._worker: threading.Thread | None = None
         self._cancel_event = threading.Event()
@@ -145,6 +146,21 @@ class PoseEstimationPanel:
         self._left_video = left
         self._right_video = right
         self._fps = fps
+        from video_viewer.stereo_timeline import load_stereo_timeline_for_videos
+        import cv2
+
+        left_cap, right_cap = cv2.VideoCapture(str(left)), cv2.VideoCapture(str(right))
+        try:
+            timeline = load_stereo_timeline_for_videos(
+                left,
+                left_frame_count=int(left_cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0,
+                right_frame_count=int(right_cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0,
+                fps=fps,
+            )
+            self._timeline_signature = timeline.signature
+        finally:
+            left_cap.release()
+            right_cap.release()
 
     def _default_status_text(self) -> str:
         if self._include_gru:
@@ -187,6 +203,7 @@ class PoseEstimationPanel:
             self._frame_count,
             self._layout,
             self._playback_cache,
+            timeline_signature=self._timeline_signature if self._layout == "stereo" else None,
         )
         if loaded and self._include_gru and self._gru_cache_path is not None:
             from video_viewer.gru_batch import try_load_gru_cache
@@ -197,6 +214,7 @@ class PoseEstimationPanel:
                 THROW_MODEL_PATH,
                 self._playback_cache,
                 layout=self._layout,
+                timeline_signature=self._timeline_signature if self._layout == "stereo" else None,
             )
         return loaded
 
@@ -217,6 +235,7 @@ class PoseEstimationPanel:
             self._cache_path,
             self._frame_count,
             self._layout,
+            timeline_signature=self._timeline_signature if self._layout == "stereo" else None,
         )
         self._cached_frame_count = 0
         if self._yolo_disk_status in ("ready", "stale"):
@@ -233,6 +252,7 @@ class PoseEstimationPanel:
                 self._gru_cache_path,
                 self._frame_count,
                 THROW_MODEL_PATH,
+                timeline_signature=self._timeline_signature if self._layout == "stereo" else None,
             )
         else:
             self._gru_disk_status = "no_model"

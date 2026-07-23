@@ -14,6 +14,8 @@ class Phase(str, Enum):
 @dataclass(frozen=True)
 class BallSample:
     frame_index: int
+    native_frame_index: int
+    capture_time_s: float
     bottom_x: int
     bottom_y: int
 

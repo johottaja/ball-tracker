@@ -460,6 +460,10 @@ class TrajectoryTracker:
             completion_id=self._completion_id,
         )
 
+    def snapshot(self) -> TrajectoryResult:
+        """Return state for a held native frame without advancing any counters."""
+        return self._result_snapshot(None)
+
     def _enter_scanning(self, wrist_pos: tuple[int, int]) -> None:
         self.phase = Phase.SCANNING_BALL
         self._scan_origin = wrist_pos

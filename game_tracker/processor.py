@@ -20,6 +20,7 @@ from video_viewer.config import THROW_MODEL_PATH
 from video_viewer.filters import _extract_wrist_pos
 from video_viewer.stereo_ball_detection import detect_stereo_balls
 from video_viewer.stereo_timeline import StereoTimeline
+from video_viewer.stereo_playback import tracker_throw_label_during_hold
 
 from calibration import TableCalibration, infer_stereo_screen_side_mapping
 from trajectory_tracking.config import SECTOR_DIRECTION_DEG
@@ -479,6 +480,13 @@ class GameTrackingProcessor:
         if active_side is not None:
             prediction = predictions.get(active_side)
         throw_label = prediction.label if prediction is not None else 0
+        throw_label = tracker_throw_label_during_hold(
+            throw_label,
+            side="left",
+            timeline=self._stereo_timeline,
+            master_index=frame_index,
+            cache=cache.main if cache is not None else None,
+        )
         main_wrist_pos = (
             _extract_wrist_pos(prediction.detection) if prediction is not None else None
         )
@@ -515,29 +523,42 @@ class GameTrackingProcessor:
                 )[secondary_side]
             secondary_wrist_pos = _extract_wrist_pos(secondary_detection)
 
-        main_result = self._main_tracker.update(
-            throw_label=throw_label,
-            wrist_pos=main_wrist_pos,
-            motion_mask=detection.main.motion_mask,
-            alternate_motion_mask=detection.main.alternate_motion_mask,
-            defer_detecting_throw=True,
-            frame_index=frame_index,
+        main_fresh = self._stereo_timeline is None or not self._stereo_timeline.is_hold("left", frame_index)
+        secondary_fresh = self._stereo_timeline is None or not self._stereo_timeline.is_hold("right", frame_index)
+        main_result = (
+            self._main_tracker.update(
+                throw_label=throw_label,
+                wrist_pos=main_wrist_pos,
+                motion_mask=detection.main.motion_mask,
+                alternate_motion_mask=detection.main.alternate_motion_mask,
+                defer_detecting_throw=True,
+                frame_index=frame_index,
+            )
+            if main_fresh
+            else self._main_tracker.snapshot()
         )
-        secondary_result = self._secondary_tracker.update_secondary(
-            throw_label=throw_label,
-            wrist_pos=secondary_wrist_pos,
-            motion_mask=detection.secondary.motion_mask,
-            alternate_motion_mask=detection.secondary.alternate_motion_mask,
-            defer_detecting_throw=True,
-            frame_index=frame_index,
+        secondary_result = (
+            self._secondary_tracker.update_secondary(
+                throw_label=throw_label,
+                wrist_pos=secondary_wrist_pos,
+                motion_mask=detection.secondary.motion_mask,
+                alternate_motion_mask=detection.secondary.alternate_motion_mask,
+                defer_detecting_throw=True,
+                frame_index=frame_index,
+            )
+            if secondary_fresh
+            else self._secondary_tracker.snapshot()
         )
-        main_reconciled, secondary_reconciled = reconcile_stereo_trackers(
-            self._main_tracker,
-            self._secondary_tracker,
-            throw_label=throw_label,
-            wrist_pos=main_wrist_pos,
-            secondary_wrist_pos=secondary_wrist_pos,
-        )
+        if main_fresh and secondary_fresh:
+            main_reconciled, secondary_reconciled = reconcile_stereo_trackers(
+                self._main_tracker,
+                self._secondary_tracker,
+                throw_label=throw_label,
+                wrist_pos=main_wrist_pos,
+                secondary_wrist_pos=secondary_wrist_pos,
+            )
+        else:
+            main_reconciled = secondary_reconciled = False
         if main_reconciled:
             self._main_pending = []
         if secondary_reconciled:

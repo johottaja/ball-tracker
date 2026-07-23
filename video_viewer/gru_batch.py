@@ -55,6 +55,7 @@ class GruInferenceStore:
     logits: np.ndarray
     probabilities: np.ndarray
     has_pose: np.ndarray
+    timeline_signature: str = ""
 
     def prediction(
         self,
@@ -99,6 +100,7 @@ def gru_cache_status(
     model_path: Path | None,
     *,
     require_player_slots: bool = False,
+    timeline_signature: str | None = None,
 ) -> GruCacheStatus:
     if model_path is None or not model_path.is_file():
         return "no_model"
@@ -108,6 +110,7 @@ def gru_cache_status(
         with np.load(path, allow_pickle=False) as data:
             frame_count = int(data["frame_count"])
             cached_model = str(data["model_path"])
+            cached_signature = str(data["timeline_signature"]) if "timeline_signature" in data else ""
             if require_player_slots and data["labels"].ndim != 2:
                 return "stale"
     except (OSError, KeyError, TypeError, ValueError):
@@ -115,6 +118,8 @@ def gru_cache_status(
     if cached_model != _model_cache_key(model_path):
         return "wrong_model"
     if expected_frame_count > 0 and frame_count != expected_frame_count:
+        return "stale"
+    if timeline_signature is not None and cached_signature != timeline_signature:
         return "stale"
     return "ready"
 
@@ -151,6 +156,7 @@ def save_gru_inferences(path: Path, store: GruInferenceStore) -> None:
         logits=store.logits,
         probabilities=store.probabilities,
         has_pose=store.has_pose,
+        timeline_signature=store.timeline_signature,
     )
     tmp.replace(path)
 
@@ -164,6 +170,7 @@ def load_gru_inferences(path: Path) -> GruInferenceStore:
             logits=data["logits"],
             probabilities=data["probabilities"],
             has_pose=data["has_pose"],
+            timeline_signature=str(data["timeline_signature"]) if "timeline_signature" in data else "",
         )
 
 
@@ -329,6 +336,15 @@ def run_stereo_gru_inference_phase(
         progress=progress,
         cancel_check=cancel_check,
     )
+    store = GruInferenceStore(
+        frame_count=store.frame_count,
+        model_path=store.model_path,
+        labels=store.labels,
+        logits=store.logits,
+        probabilities=store.probabilities,
+        has_pose=store.has_pose,
+        timeline_signature=yolo_store.timeline_signature,
+    )
     save_gru_inferences(output_path, store)
     return store
 
@@ -417,6 +433,7 @@ def try_load_gru_cache(
     cache: PlaybackCache,
     *,
     layout: Literal["mono", "stereo"],
+    timeline_signature: str | None = None,
 ) -> bool:
     if (
         gru_cache_status(
@@ -424,6 +441,7 @@ def try_load_gru_cache(
             expected_frame_count,
             model_path,
             require_player_slots=layout == "stereo",
+            timeline_signature=timeline_signature,
         )
         != "ready"
     ):

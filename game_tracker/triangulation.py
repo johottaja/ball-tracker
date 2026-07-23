@@ -228,20 +228,23 @@ def _fit_curve_3d(
     if len(points) < 3:
         return [CurvePoint3D(x=p.x, y=p.y, z=p.z) for p in points]
 
-    frames = np.array([p.frame if p.frame is not None else i for i, p in enumerate(points)])
+    parameters = np.array(
+        [p.time_s if p.time_s is not None else (p.frame if p.frame is not None else i) for i, p in enumerate(points)],
+        dtype=np.float64,
+    )
     xs = np.array([p.x for p in points], dtype=np.float64)
     ys = np.array([p.y for p in points], dtype=np.float64)
     zs = np.array([p.z for p in points], dtype=np.float64)
 
     try:
-        cx = np.polyfit(frames, xs, 2)
-        cy = np.polyfit(frames, ys, 2)
-        cz = np.polyfit(frames, zs, 2)
+        cx = np.polyfit(parameters, xs, 2)
+        cy = np.polyfit(parameters, ys, 2)
+        cz = np.polyfit(parameters, zs, 2)
     except np.linalg.LinAlgError:
         return [CurvePoint3D(x=p.x, y=p.y, z=p.z) for p in points]
 
-    t_start = float(frames.min())
-    t_end = float(frames.max())
+    t_start = float(parameters.min())
+    t_end = float(parameters.max())
     t_sample = np.linspace(t_start, t_end, sample_count)
     return [
         CurvePoint3D(
@@ -342,6 +345,7 @@ def triangulate_throw(
                 x=float(triangulated[0]),
                 y=float(triangulated[1]),
                 z=float(triangulated[2]),
+                time_s=target_time,
             )
         )
 
@@ -367,10 +371,11 @@ def triangulate_throw(
     end_frame = max(p.frame for p in left_track if p.frame is not None)
     fitted = _fit_curve_3d(points_3d)
 
-    if timeline is not None:
+    point_times = [point.time_s for point in points_3d if point.time_s is not None]
+    if len(point_times) >= 2:
+        duration_s = max(point_times) - min(point_times)
+    elif timeline is not None:
         duration_s = timeline.duration_between_frames_s(start_frame, end_frame)
-        if end_frame > start_frame:
-            duration_s += timeline.slot_duration_s(end_frame)
     else:
         duration_s = (end_frame - start_frame + 1) / fps if fps > 0 else 0.0
     curve_len = _polyline_length_3d([(p.x, p.y, p.z) for p in fitted])

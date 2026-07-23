@@ -272,6 +272,9 @@ class GameTrackerApp:
             self.frame_count,
             "stereo",
             self.playback_cache,
+            timeline_signature=(
+                self.stereo_timeline.signature if self.stereo_timeline is not None else None
+            ),
         ):
             return
         if THROW_MODEL_PATH is not None and THROW_MODEL_PATH.is_file():
@@ -281,6 +284,11 @@ class GameTrackerApp:
                 THROW_MODEL_PATH,
                 self.playback_cache,
                 layout="stereo",
+                timeline_signature=(
+                    self.stereo_timeline.signature
+                    if self.stereo_timeline is not None
+                    else None
+                ),
             )
 
     def _reset_playback_tracking(self) -> None:
@@ -620,8 +628,8 @@ class GameTrackerApp:
             left_video=self.left.default_video,
         )
         detail = (
-            f"{timeline.master_count} master slots "
-            f"(left {left_count}, right {right_count}, ref {timeline.reference})"
+            f"{timeline.master_count} paired master slots "
+            f"(left {left_count}, right {right_count})"
         )
         return timeline.master_count, detail
 
@@ -989,6 +997,8 @@ class GameTrackerApp:
             time_s = self.frame_index / self.fps if self.fps else 0
         hold_bits: list[str] = []
         if self.stereo_timeline is not None:
+            if not self.stereo_timeline.captured_timestamps:
+                hold_bits.append("synthetic alignment; processing disabled")
             if self.stereo_timeline.is_hold("left", self.frame_index):
                 hold_bits.append("left hold")
             if self.stereo_timeline.is_hold("right", self.frame_index):

@@ -33,7 +33,6 @@ from video_viewer.stereo_playback import (
     gru_warmup_for_timeline_playback,
     stereo_timeline_ball_mask_inputs,
     stereo_timeline_filter_inputs,
-    tracker_throw_label_during_left_hold,
 )
 from video_viewer.stereo_timeline import (
     STEREO_TIMELINE_FILENAME,
@@ -534,8 +533,8 @@ class StereoViewerApp:
             left_video=self.left.default_video,
         )
         detail = (
-            f"{timeline.master_count} master slots "
-            f"(left {left_count}, right {right_count}, ref {timeline.reference})"
+            f"{timeline.master_count} paired master slots "
+            f"(left {left_count}, right {right_count})"
         )
         return timeline.master_count, detail
 
@@ -919,6 +918,11 @@ class StereoViewerApp:
                 video_fps=video_fps,
                 cache=cache,
                 ball_method=ball_method,
+                stereo_timeline=(
+                    self.stereo_reader.timeline
+                    if self.stereo_reader is not None
+                    else None
+                ),
             )
         else:
             left_filtered = self._filtered_frame(
@@ -1109,6 +1113,8 @@ class StereoViewerApp:
         )
         hold_bits: list[str] = []
         if self.stereo_timeline is not None:
+            if not self.stereo_timeline.captured_timestamps:
+                hold_bits.append("synthetic alignment")
             if self.stereo_timeline.is_hold("left", self.frame_index):
                 hold_bits.append("left hold")
             if self.stereo_timeline.is_hold("right", self.frame_index):

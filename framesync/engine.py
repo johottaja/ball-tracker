@@ -18,6 +18,7 @@ class FrameSyncEngine:
         self._secondary = CameraSyncTracker()
         self._session_active = False
         self._session_start_frame: int | None = None
+        self._session_start_time_s: float | None = None
         self._main_joined = False
         self._secondary_joined = False
         self._latest_offset: float | None = None
@@ -29,6 +30,7 @@ class FrameSyncEngine:
         self._secondary.reset()
         self._session_active = False
         self._session_start_frame = None
+        self._session_start_time_s = None
         self._main_joined = False
         self._secondary_joined = False
         self._cooldown_until_frame = None
@@ -53,6 +55,12 @@ class FrameSyncEngine:
         secondary_ball_bottom: tuple[int, int] | None,
         *,
         video_fps: float | None = None,
+        main_native_frame_index: int | None = None,
+        secondary_native_frame_index: int | None = None,
+        main_capture_time_s: float | None = None,
+        secondary_capture_time_s: float | None = None,
+        main_fresh: bool = True,
+        secondary_fresh: bool = True,
     ) -> FrameSyncResult:
         if self._in_cooldown(frame_index):
             return self._cooldown_result(main_ball_bottom, secondary_ball_bottom)
@@ -60,16 +68,30 @@ class FrameSyncEngine:
         prev_main_phase = self._main.phase
         prev_secondary_phase = self._secondary.phase
 
-        main_result = self._main.update(frame_index, main_ball_bottom)
-        secondary_result = self._secondary.update(frame_index, secondary_ball_bottom)
+        main_result = self._main.update(
+            frame_index, main_ball_bottom, native_frame_index=main_native_frame_index,
+            capture_time_s=main_capture_time_s, fresh=main_fresh,
+        )
+        secondary_result = self._secondary.update(
+            frame_index, secondary_ball_bottom, native_frame_index=secondary_native_frame_index,
+            capture_time_s=secondary_capture_time_s, fresh=secondary_fresh,
+        )
 
         if self._main.phase == Phase.SYNCING and prev_main_phase == Phase.WATCHING:
-            self._on_camera_entered_syncing(is_main=True, frame_index=frame_index)
+            self._on_camera_entered_syncing(
+                is_main=True, frame_index=frame_index, time_s=main_capture_time_s
+            )
         if self._secondary.phase == Phase.SYNCING and prev_secondary_phase == Phase.WATCHING:
-            self._on_camera_entered_syncing(is_main=False, frame_index=frame_index)
+            self._on_camera_entered_syncing(
+                is_main=False, frame_index=frame_index, time_s=secondary_capture_time_s
+            )
 
         if self._session_active:
-            self._check_session_timeouts(frame_index)
+            self._check_session_timeouts(
+                frame_index, max(value for value in (main_capture_time_s, secondary_capture_time_s) if value is not None)
+                if main_capture_time_s is not None or secondary_capture_time_s is not None else None,
+                video_fps,
+            )
             if self._both_done():
                 self._complete_session(frame_index, video_fps)
 
@@ -118,10 +140,13 @@ class FrameSyncEngine:
         cooldown_frames = max(1, round(fps * SYNC_COOLDOWN_SECONDS))
         self._cooldown_until_frame = frame_index + cooldown_frames
 
-    def _on_camera_entered_syncing(self, *, is_main: bool, frame_index: int) -> None:
+    def _on_camera_entered_syncing(
+        self, *, is_main: bool, frame_index: int, time_s: float | None
+    ) -> None:
         if not self._session_active:
             self._session_active = True
             self._session_start_frame = frame_index
+            self._session_start_time_s = time_s
             self._main_joined = is_main
             self._secondary_joined = not is_main
             return
@@ -140,20 +165,27 @@ class FrameSyncEngine:
             and self._secondary.phase == Phase.DONE
         )
 
-    def _check_session_timeouts(self, frame_index: int) -> None:
+    def _check_session_timeouts(
+        self, frame_index: int, time_s: float | None, video_fps: float | None
+    ) -> None:
         if self._session_start_frame is None:
             return
 
-        elapsed = frame_index - self._session_start_frame
+        fps = video_fps if video_fps and video_fps > 0 else 30.0
+        elapsed = (
+            time_s - self._session_start_time_s
+            if time_s is not None and self._session_start_time_s is not None
+            else (frame_index - self._session_start_frame) / fps
+        )
 
         if (
-            elapsed > SYNC_PAIRING_WINDOW_FRAMES
+            elapsed > SYNC_PAIRING_WINDOW_FRAMES / fps
             and not (self._main_joined and self._secondary_joined)
         ):
             self._abort_session()
             return
 
-        if elapsed > SYNC_TIMEOUT_FRAMES and not self._both_done():
+        if elapsed > SYNC_TIMEOUT_FRAMES / fps and not self._both_done():
             self._abort_session()
 
     def _complete_session(
@@ -176,7 +208,8 @@ class FrameSyncEngine:
             self._abort_session()
             return
 
-        self._latest_offset = round(secondary_t - main_t, 2)
+        fps = video_fps if video_fps and video_fps > 0 else 30.0
+        self._latest_offset = round((secondary_t - main_t) * fps, 2)
         self._sync_id += 1
         self._start_cooldown(frame_index, video_fps)
         self._end_session()
@@ -187,6 +220,7 @@ class FrameSyncEngine:
     def _end_session(self) -> None:
         self._session_active = False
         self._session_start_frame = None
+        self._session_start_time_s = None
         self._main_joined = False
         self._secondary_joined = False
         self._main.reset()

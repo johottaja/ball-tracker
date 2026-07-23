@@ -54,6 +54,12 @@ right-side and older throws.
 Reprocess recordings after upgrading: the pose and GRU cache formats now retain
 separate left/right player slots, so older single-player caches are regenerated.
 
+Stereo recordings retain native frames and store per-frame capture timestamps in
+`stereo_timeline.json`. Playback pairs nearby camera captures on a shared master
+timeline and holds either camera when the other produces an unmatched frame.
+Game processing requires those timestamps so that 3D point matching, curve
+fitting, and speed calculations use real capture time.
+
 ## Using the training recorder
 
 - Enter a **Training set** name (e.g. `throws_v1`). Clips for the same name are saved together.

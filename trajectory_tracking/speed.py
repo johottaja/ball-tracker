@@ -41,21 +41,23 @@ def estimate_throw_speed_m_s(
     torso_length_px: float | None,
     tracking_frames: int | None,
     video_fps: float | None,
+    duration_s: float | None = None,
 ) -> float | None:
     """Infer throw speed from fitted curve length and torso-based scale."""
     if curve_points is None or len(curve_points) < 2:
         return None
     if torso_length_px is None or torso_length_px <= 0:
         return None
-    if tracking_frames is None or tracking_frames <= 0:
-        return None
-    if video_fps is None or video_fps <= 0:
-        return None
+    if duration_s is None:
+        if tracking_frames is None or tracking_frames <= 0:
+            return None
+        if video_fps is None or video_fps <= 0:
+            return None
+        duration_s = tracking_frames / video_fps
 
     curve_px = polyline_length_px(curve_points)
     meters_per_px = (ASSUMED_TORSO_CM / 100.0) / torso_length_px
     distance_m = curve_px * meters_per_px
-    duration_s = tracking_frames / video_fps
     if duration_s <= 0:
         return None
     return distance_m / duration_s

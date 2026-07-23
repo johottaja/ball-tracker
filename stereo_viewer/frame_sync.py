@@ -8,6 +8,7 @@ from video_viewer.ball_detection import draw_ball_rectangle
 from video_viewer.ball_motion import BallDetectionMethod, MotionMaskBuilder
 from video_viewer.filters import FilterId
 from video_viewer.stereo_ball_detection import detect_stereo_balls
+from video_viewer.stereo_timeline import StereoTimeline
 
 
 class FrameSyncProcessor:
@@ -44,6 +45,7 @@ class FrameSyncProcessor:
         video_fps: float | None = None,
         cache: object | None = None,
         ball_method: object | None = None,
+        stereo_timeline: StereoTimeline | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         if (
             cache is not None
@@ -94,6 +96,28 @@ class FrameSyncProcessor:
             detection.main.ball_bottom,
             detection.secondary.ball_bottom,
             video_fps=video_fps,
+            main_native_frame_index=(
+                stereo_timeline.source_index("left", frame_index)
+                if stereo_timeline is not None
+                else frame_index
+            ),
+            secondary_native_frame_index=(
+                stereo_timeline.source_index("right", frame_index)
+                if stereo_timeline is not None
+                else frame_index
+            ),
+            main_capture_time_s=(
+                stereo_timeline.capture_time("left", frame_index)
+                if stereo_timeline is not None
+                else None
+            ),
+            secondary_capture_time_s=(
+                stereo_timeline.capture_time("right", frame_index)
+                if stereo_timeline is not None
+                else None
+            ),
+            main_fresh=stereo_timeline is None or not stereo_timeline.is_hold("left", frame_index),
+            secondary_fresh=stereo_timeline is None or not stereo_timeline.is_hold("right", frame_index),
         )
         record_framesync_completion(
             self._engine,

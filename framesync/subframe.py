@@ -8,7 +8,7 @@ def estimate_bounce_subframe_index(
     bounce: BounceInterval,
 ) -> float | None:
     """
-    Estimate the subframe index where the ball reversed vertical direction.
+    Estimate the capture time where the ball reversed vertical direction.
 
     Uses linear velocity zero-crossing between the bounce frame pair; falls back
     to a quadratic fit around the lowest (maximum y) sample when needed.
@@ -28,11 +28,13 @@ def estimate_bounce_subframe_index(
     if vy_prev == 0 and vy_curr == 0:
         return _quadratic_vertex_time(samples, bounce)
     if vy_prev == vy_curr:
-        return float(bounce.frame_prev)
+        return prev_sample.capture_time_s
 
     fraction = vy_prev / (vy_prev - vy_curr)
     fraction = max(0.0, min(1.0, fraction))
-    return bounce.frame_prev + fraction
+    return prev_sample.capture_time_s + fraction * (
+        curr_sample.capture_time_s - prev_sample.capture_time_s
+    )
 
 
 def _sample_before(samples: list[BallSample], frame_index: int) -> BallSample | None:
@@ -52,7 +54,11 @@ def _quadratic_vertex_time(
         if bounce.frame_prev - 2 <= sample.frame_index <= bounce.frame_curr + 2
     ]
     if len(window) < 3:
-        return float(bounce.frame_prev)
+        return next(
+            sample.capture_time_s
+            for sample in samples
+            if sample.frame_index == bounce.frame_prev
+        )
 
     peak = max(window, key=lambda sample: sample.bottom_y)
     neighbors = sorted(
@@ -64,9 +70,9 @@ def _quadratic_vertex_time(
         key=lambda sample: sample.frame_index,
     )
     if len(neighbors) < 3:
-        return float(peak.frame_index)
+        return peak.capture_time_s
 
-    xs = [float(sample.frame_index) for sample in neighbors]
+    xs = [sample.capture_time_s for sample in neighbors]
     ys = [float(sample.bottom_y) for sample in neighbors]
     # Fit y = a*t^2 + b*t + c; vertex at t = -b / (2a).
     n = len(xs)

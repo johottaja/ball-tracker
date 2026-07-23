@@ -159,14 +159,24 @@ class StereoTrackingProcessor:
         *,
         last_completion_id: int,
         video_fps: float | None,
+        timeline: StereoTimeline | None,
+        side: str,
     ) -> tuple[float | None, int]:
         if tracking_result.completion_id == last_completion_id:
             return None, last_completion_id
+        duration_s = None
+        frames = tracking_result.completed_trajectory_frames
+        if timeline is not None and frames and len(frames) >= 2:
+            duration_s = (
+                timeline.capture_time(side, frames[-1])
+                - timeline.capture_time(side, frames[0])
+            )
         speed = estimate_throw_speed_m_s(
             tracking_result.fitted_curve_points,
             self._torso_length_buffer.smoothed,
             tracking_result.completed_tracking_frames,
             video_fps,
+            duration_s=duration_s,
         )
         return speed, tracking_result.completion_id
 
@@ -250,6 +260,34 @@ class StereoTrackingProcessor:
                 detection.main.ball_bottom,
                 detection.secondary.ball_bottom,
                 video_fps=video_fps,
+                main_native_frame_index=(
+                    stereo_timeline.source_index("left", frame_index)
+                    if stereo_timeline is not None
+                    else frame_index
+                ),
+                secondary_native_frame_index=(
+                    stereo_timeline.source_index("right", frame_index)
+                    if stereo_timeline is not None
+                    else frame_index
+                ),
+                main_capture_time_s=(
+                    stereo_timeline.capture_time("left", frame_index)
+                    if stereo_timeline is not None
+                    else None
+                ),
+                secondary_capture_time_s=(
+                    stereo_timeline.capture_time("right", frame_index)
+                    if stereo_timeline is not None
+                    else None
+                ),
+                main_fresh=(
+                    stereo_timeline is None
+                    or not stereo_timeline.is_hold("left", frame_index)
+                ),
+                secondary_fresh=(
+                    stereo_timeline is None
+                    or not stereo_timeline.is_hold("right", frame_index)
+                ),
             )
             record_framesync_completion(
                 self._framesync_engine,
@@ -352,29 +390,48 @@ class StereoTrackingProcessor:
                     frame_index=frame_index,
                 )
 
-        main_result = self._main_tracker.update(
-            throw_label=throw_label,
-            wrist_pos=main_wrist_pos,
-            motion_mask=detection.main.motion_mask,
-            alternate_motion_mask=detection.main.alternate_motion_mask,
-            defer_detecting_throw=True,
-            frame_index=frame_index,
+        main_fresh = (
+            stereo_timeline is None
+            or frame_index is None
+            or not stereo_timeline.is_hold("left", frame_index)
         )
-        secondary_result = self._secondary_tracker.update_secondary(
-            throw_label=throw_label,
-            wrist_pos=secondary_wrist_pos,
-            motion_mask=detection.secondary.motion_mask,
-            alternate_motion_mask=detection.secondary.alternate_motion_mask,
-            defer_detecting_throw=True,
-            frame_index=frame_index,
+        secondary_fresh = (
+            stereo_timeline is None
+            or frame_index is None
+            or not stereo_timeline.is_hold("right", frame_index)
         )
-        reconcile_stereo_trackers(
-            self._main_tracker,
-            self._secondary_tracker,
-            throw_label=throw_label,
-            wrist_pos=main_wrist_pos,
-            secondary_wrist_pos=secondary_wrist_pos,
+        main_result = (
+            self._main_tracker.update(
+                throw_label=throw_label,
+                wrist_pos=main_wrist_pos,
+                motion_mask=detection.main.motion_mask,
+                alternate_motion_mask=detection.main.alternate_motion_mask,
+                defer_detecting_throw=True,
+                frame_index=frame_index,
+            )
+            if main_fresh
+            else self._main_tracker.snapshot()
         )
+        secondary_result = (
+            self._secondary_tracker.update_secondary(
+                throw_label=throw_label,
+                wrist_pos=secondary_wrist_pos,
+                motion_mask=detection.secondary.motion_mask,
+                alternate_motion_mask=detection.secondary.alternate_motion_mask,
+                defer_detecting_throw=True,
+                frame_index=frame_index,
+            )
+            if secondary_fresh
+            else self._secondary_tracker.snapshot()
+        )
+        if main_fresh and secondary_fresh:
+            reconcile_stereo_trackers(
+                self._main_tracker,
+                self._secondary_tracker,
+                throw_label=throw_label,
+                wrist_pos=main_wrist_pos,
+                secondary_wrist_pos=secondary_wrist_pos,
+            )
         if (
             self._active_player_side is not None
             and self._main_tracker.phase == Phase.DETECTING_THROW
@@ -402,6 +459,8 @@ class StereoTrackingProcessor:
             main_result,
             last_completion_id=self._main_last_completion_id,
             video_fps=video_fps,
+            timeline=stereo_timeline,
+            side="left",
         )
         if main_speed is not None:
             self._main_completed_speed_m_s = main_speed
@@ -411,6 +470,8 @@ class StereoTrackingProcessor:
                 secondary_result,
                 last_completion_id=self._secondary_last_completion_id,
                 video_fps=video_fps,
+                timeline=stereo_timeline,
+                side="right",
             )
         )
         if secondary_speed is not None:

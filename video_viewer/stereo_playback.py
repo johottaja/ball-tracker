@@ -131,6 +131,8 @@ def gru_warmup_for_timeline_playback(
     gru_stream_frame_index: int | None,
     buffer_size: int,
     cache: object | None = None,
+    *,
+    side: Side = "left",
 ) -> tuple[list[np.ndarray] | None, int | None]:
     """Rebuild GRU history only after a seek; return None on sequential forward steps."""
     if cache is not None and cache.has_gru(master_index):
@@ -141,21 +143,22 @@ def gru_warmup_for_timeline_playback(
     ):
         return None, None
     warmup_frames, warmup_start_index = reader.master_warmup_frames(
-        "left", master_index, buffer_size - 1
+        side, master_index, buffer_size - 1
     )
     if not warmup_frames:
         return None, None
     return warmup_frames, warmup_start_index
 
 
-def tracker_throw_label_during_left_hold(
+def tracker_throw_label_during_hold(
     throw_label: int,
     *,
+    side: Side,
     timeline: StereoTimeline | None,
     master_index: int | None,
     cache: object | None,
 ) -> int:
-    """Keep the tracker throw label across left-camera holds.
+    """Keep a tracker throw label across held native pixels.
 
     GRU is re-run on held pixels for the overlay; the logit often drops even though
     the throw is still in progress on the reference timeline. The trajectory tracker
@@ -165,12 +168,29 @@ def tracker_throw_label_during_left_hold(
         timeline is None
         or master_index is None
         or master_index <= 0
-        or not timeline.is_hold("left", master_index)
+        or not timeline.is_hold(side, master_index)
         or cache is None
         or not cache.has_gru(master_index - 1)
     ):
         return throw_label
     return cache.get_gru(master_index - 1).label
+
+
+# Compatibility for callers outside the stereo tracking path.
+def tracker_throw_label_during_left_hold(
+    throw_label: int,
+    *,
+    timeline: StereoTimeline | None,
+    master_index: int | None,
+    cache: object | None,
+) -> int:
+    return tracker_throw_label_during_hold(
+        throw_label,
+        side="left",
+        timeline=timeline,
+        master_index=master_index,
+        cache=cache,
+    )
 
 
 def iter_stereo_timeline(

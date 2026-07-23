@@ -83,6 +83,7 @@ class StereoYoloInferenceStore:
     left_player_sides: np.ndarray
     right_player_keypoints: np.ndarray
     right_player_sides: np.ndarray
+    timeline_signature: str = ""
 
     def detection(
         self,
@@ -141,6 +142,8 @@ def yolo_cache_status(
     path: Path,
     expected_frame_count: int,
     layout: YoloCacheLayout,
+    *,
+    timeline_signature: str | None = None,
 ) -> YoloCacheStatus:
     if not path.is_file():
         return "missing"
@@ -154,9 +157,12 @@ def yolo_cache_status(
             if layout == "stereo" and "left_player_keypoints" not in data:
                 return "stale"
             frame_count = int(data["frame_count"])
+            cached_signature = str(data["timeline_signature"]) if "timeline_signature" in data else ""
     except (OSError, KeyError, TypeError, ValueError):
         return "missing"
     if expected_frame_count > 0 and frame_count != expected_frame_count:
+        return "stale"
+    if timeline_signature is not None and cached_signature != timeline_signature:
         return "stale"
     return "ready"
 
@@ -199,6 +205,7 @@ def save_stereo_yolo_inferences(path: Path, store: StereoYoloInferenceStore) -> 
         tmp,
         layout="stereo_players_v2",
         frame_count=store.frame_count,
+        timeline_signature=store.timeline_signature,
         left_player_keypoints=store.left_player_keypoints,
         left_player_sides=store.left_player_sides,
         right_player_keypoints=store.right_player_keypoints,
@@ -230,6 +237,7 @@ def load_stereo_yolo_inferences(path: Path) -> StereoYoloInferenceStore:
             raise ValueError(f"Legacy single-player YOLO cache at {path}; re-run preprocess")
         return StereoYoloInferenceStore(
             frame_count=int(data["frame_count"]),
+            timeline_signature=str(data["timeline_signature"]) if "timeline_signature" in data else "",
             left_player_keypoints=data["left_player_keypoints"],
             left_player_sides=data["left_player_sides"],
             right_player_keypoints=data["right_player_keypoints"],
@@ -279,8 +287,12 @@ def try_load_pose_cache(
     expected_frame_count: int,
     layout: YoloCacheLayout,
     cache: PlaybackCache,
+    *,
+    timeline_signature: str | None = None,
 ) -> bool:
-    if yolo_cache_status(path, expected_frame_count, layout) != "ready":
+    if yolo_cache_status(
+        path, expected_frame_count, layout, timeline_signature=timeline_signature
+    ) != "ready":
         return False
     if layout == "mono":
         store = load_mono_yolo_inferences(path)
@@ -322,7 +334,9 @@ def open_stereo_timeline_reader(
         right_frame_count=right_total,
         fps=effective_fps,
     )
-    total = frame_count if frame_count > 0 else timeline.master_count
+    # The timeline is authoritative. A stale caller-provided count must never
+    # index beyond a rebuilt bidirectional master mapping.
+    total = timeline.master_count
     reader = StereoFrameReader(left_cap, right_cap, timeline)
     return reader, total
 
@@ -466,6 +480,7 @@ def run_stereo_yolo_inference_phase(
 
     store = StereoYoloInferenceStore(
         frame_count=total,
+        timeline_signature=reader.timeline.signature,
         left_player_keypoints=left_players,
         left_player_sides=left_player_sides,
         right_player_keypoints=right_players,

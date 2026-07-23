@@ -39,11 +39,14 @@ class Point3D:
     x: float
     y: float
     z: float
+    time_s: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {"x": self.x, "y": self.y, "z": self.z}
         if self.frame is not None:
             d["frame"] = self.frame
+        if self.time_s is not None:
+            d["time_s"] = self.time_s
         return d
 
 
@@ -145,6 +148,7 @@ class GameSession:
                             x=float(p["x"]),
                             y=float(p["y"]),
                             z=float(p["z"]),
+                            time_s=float(p["time_s"]) if "time_s" in p else None,
                         )
                         for p in item.get("points_3d", [])
                     ],

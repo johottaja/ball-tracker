@@ -26,6 +26,7 @@ from video_viewer.yolo_batch import (
     open_stereo_timeline_reader,
     populate_stereo_pose_cache,
     run_stereo_yolo_inference_phase,
+    save_yolo_inferences,
     yolo_cache_status,
 )
 
@@ -114,6 +115,12 @@ def run_tracking_phase(
         frame_count=frame_count,
         fps=fps,
     )
+    if not reader.timeline.captured_timestamps:
+        reader.release()
+        raise ValueError(
+            "Game processing requires valid stereo capture timestamps; "
+            "synthetic alignment is playback-only."
+        )
     processor.set_stereo_timeline(reader.timeline)
 
     cache = PlaybackCache()
@@ -224,8 +231,21 @@ def process_game_recording(
     """Three-phase offline processing: YOLO, GRU, then game tracking."""
     yolo_progress = _yolo_progress_adapter(progress)
     gru_progress = _gru_progress_adapter(progress)
+    timeline_reader, _ = open_stereo_timeline_reader(
+        left_path, right_path, frame_count=frame_count, fps=fps
+    )
+    timeline = timeline_reader.timeline
+    timeline_reader.release()
+    if not timeline.captured_timestamps:
+        raise ValueError(
+            "Game processing requires valid stereo capture timestamps; "
+            "synthetic alignment is playback-only."
+        )
+    timeline_signature = timeline.signature
 
-    if yolo_cache_status(YOLO_INFERENCES, frame_count, "stereo") == "ready":
+    if yolo_cache_status(
+        YOLO_INFERENCES, frame_count, "stereo", timeline_signature=timeline_signature
+    ) == "ready":
         yolo_store = load_stereo_yolo_inferences(YOLO_INFERENCES)
     else:
         yolo_store = run_stereo_yolo_inference_phase(
@@ -248,6 +268,7 @@ def process_game_recording(
                 frame_count,
                 THROW_MODEL_PATH,
                 require_player_slots=True,
+                timeline_signature=timeline_signature,
             )
             == "ready"
         ):
