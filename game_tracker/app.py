@@ -322,6 +322,14 @@ class GameTrackerApp:
             right_frame,
             DISPLAY_MAX_SIZE,
             on_save=self._on_calibration_saved,
+            frame_provider=lambda: capture_stereo_pair(
+                mode=self.mode.get(),
+                frame_index=self.frame_index,
+                left_last_raw=self.left.last_raw_frame,
+                right_last_raw=self.right.last_raw_frame,
+                left_cap=self.left.cap,
+                right_cap=self.right.cap,
+            ),
         ).show()
 
     def _on_calibration_saved(self, calibration: TableCalibration) -> None:

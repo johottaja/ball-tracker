@@ -18,7 +18,7 @@ Guidance for AI agents working in this repository.
 - **`throw_detection/`** — throw-event labeling GUI, GRU training-data export, GRU training GUI, and streaming GRU inference. Labels per-frame throw/not-throw on clips from `recordings/<set>/`; saves NumPy `.npz` datasets under `throw_detection/training_sets/`; trained models under `throw_detection/models/`.
 - **`trajectory_tracking/`** — stateful ball trajectory tracker that combines throw inference with configurable ball motion masks. Three phases: detecting throw → scanning for ball in a circular sector from the wrist → tracking ball frame-by-frame. Fits a parabola to the collected positions and exposes drawing helpers for the video viewer filter.
 - **`framesync/`** — stereo camera frame-offset measurement from deliberate straight-down ball drops and table bounces. Per-camera macro phase machine plus subframe bounce-time estimation; reused by the stereo viewer **Frame sync** filter.
-- **`calibration/`** — shared table-corner calibration UI and homography math. **Calibrate** in `stereo_viewer` and `game_tracker` saves `calibration.json` at the repo root (gitignored): table dimensions, calibration frame size, per-camera 3×4 projection matrices (computed from corner clicks at save time), and persisted camera layout stats (positions, angles, FOVs, stereo baseline). `game_tracker` triangulates 3D throws directly from the saved projection matrices via `cv2.triangulatePoints`; **Camera layout** reads the saved layout stats.
+- **`calibration/`** — shared table-corner calibration UI and homography math. After the four corners are clicked on each camera, **Calibrate** uses MediaPipe Hands to capture a stable index fingertip at each known table corner from the live stereo feed, then refines the camera poses while retaining calibrated intrinsics. It saves `calibration.json` at the repo root (gitignored): table dimensions, calibration frame size, per-camera 3×4 projection matrices, and persisted camera layout stats (positions, angles, FOVs, stereo baseline). MediaPipe's `hand_landmarker.task` is downloaded on first refinement and gitignored. `game_tracker` triangulates 3D throws directly from the saved projection matrices via `cv2.triangulatePoints`; **Camera layout** reads the saved layout stats.
 - **`throw_visualizer/`** — React + Vite + Tailwind + Three.js SPA that loads `game_tracker/games/*.json` (or a user-uploaded file) and renders the calibrated table plus 3D throw curves. Table origin at center, playing surface at Z=0, floor at Z=−0.8 m.
 
 Dual-camera synchronized recording is available via `stereo_viewer` and `game_tracker`. Stereo 3D triangulation and JSON export are implemented in `game_tracker`; the initial React 3D viewer lives in `throw_visualizer/`.
@@ -141,6 +141,8 @@ balltracker/
 │   ├── homography.py         # corner→H, H→projection matrix, triangulation helpers
 │   ├── layout.py             # camera layout stats and screen-side mapping from projection matrices
 │   ├── layout_dialog.py      # Camera layout top-down visualization
+│   ├── fingertip.py          # MediaPipe index-fingertip detector
+│   ├── refine.py             # Fingertip observations → projection pose refinement
 │   ├── storage.py            # load/save calibration.json (+ layout attach/migrate)
 │   ├── dialog.py             # TableCalibrationDialog
 │   └── frames.py             # capture_stereo_pair from record/playback state
@@ -374,7 +376,7 @@ Tune via `framesync/config.py`: `DROP_STREAK_FRAMES`, `MAX_HORIZONTAL_DELTA_PX`,
 **`game_tracker/config.py`**
 
 - **Paths:** `RECORDINGS_DIR`, `LEFT_VIDEO`, `RIGHT_VIDEO`, `GAME_JSON`
-- **Triangulation:** `MIN_TRIANGULATION_HEIGHT_M`, `MAX_TRIANGULATION_HEIGHT_M`, `MAX_TRIANGULATION_RESIDUAL_M`
+- **Triangulation:** `MIN_TRIANGULATION_HEIGHT_M`, `MAX_TRIANGULATION_HEIGHT_M`
 
 **`pose_detection/config.py`**
 

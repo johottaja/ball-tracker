@@ -13,7 +13,6 @@ from video_viewer.stereo_timeline import StereoTimeline
 from .config import (
     MAX_TRACK_INTERPOLATION_GAP_S,
     MAX_TRIANGULATION_HEIGHT_M,
-    MAX_TRIANGULATION_RESIDUAL_M,
     MIN_TRIANGULATION_HEIGHT_M,
 )
 from .game_data import CurvePoint3D, Point2D, Point3D, ThrowRecord
@@ -66,73 +65,23 @@ def _triangulate_point(
     p_left: np.ndarray,
     p_right: np.ndarray,
     model: StereoProjectionModel,
-) -> tuple[np.ndarray | None, float, str | None]:
+) -> tuple[np.ndarray | None, str | None]:
     pts_left = np.array([[p_left[0]], [p_left[1]]], dtype=np.float64)
     pts_right = np.array([[p_right[0]], [p_right[1]]], dtype=np.float64)
     points_4d = cv2.triangulatePoints(model.p_left, model.p_right, pts_left, pts_right)
     w = points_4d[3, 0]
     if abs(w) < 1e-9:
-        return None, float("inf"), "degenerate_homogeneous_coordinate"
+        return None, "degenerate_homogeneous_coordinate"
     point = points_4d[:3, 0] / w
-
-    # Epipolar residual via closest approach between the two viewing rays.
-    c_left = _camera_center(model.p_left)
-    c_right = _camera_center(model.p_right)
-    if c_left is None or c_right is None:
-        return None, float("inf"), "invalid_camera_center"
-
-    dir_left = point - c_left
-    dir_right = point - c_right
-    dir_left_norm = np.linalg.norm(dir_left)
-    dir_right_norm = np.linalg.norm(dir_right)
-    if dir_left_norm < 1e-9 or dir_right_norm < 1e-9:
-        return None, float("inf"), "degenerate_viewing_ray"
-    dir_left = dir_left / dir_left_norm
-    dir_right = dir_right / dir_right_norm
-
-    w0 = c_left - c_right
-    a = np.dot(dir_left, dir_left)
-    b = np.dot(dir_left, dir_right)
-    c = np.dot(dir_right, dir_right)
-    d = np.dot(dir_left, w0)
-    e = np.dot(dir_right, w0)
-    denom = a * c - b * b
-    if abs(denom) < 1e-9:
-        residual = float(np.linalg.norm(point - c_left))
-    else:
-        sc = (b * e - c * d) / denom
-        tc = (a * e - b * d) / denom
-        closest_left = c_left + sc * dir_left
-        closest_right = c_right + tc * dir_right
-        residual = float(np.linalg.norm(closest_left - closest_right) / 2.0)
 
     if point[2] < MIN_TRIANGULATION_HEIGHT_M or point[2] > MAX_TRIANGULATION_HEIGHT_M:
         return (
             None,
-            residual,
             "height_out_of_range "
             f"(z={point[2]:.3f} m, "
             f"range=[{MIN_TRIANGULATION_HEIGHT_M:.1f}, {MAX_TRIANGULATION_HEIGHT_M:.1f}] m)",
         )
-    if residual > MAX_TRIANGULATION_RESIDUAL_M:
-        return (
-            None,
-            residual,
-            f"residual_too_high ({residual:.3f} m, max={MAX_TRIANGULATION_RESIDUAL_M:.1f} m)",
-        )
-    return point, residual, None
-
-
-def _camera_center(projection: np.ndarray) -> np.ndarray | None:
-    """Camera center in world coordinates from a 3×4 projection matrix."""
-    if projection.shape != (3, 4):
-        return None
-    r = projection[:, :3]
-    t = projection[:, 3]
-    det = np.linalg.det(r)
-    if abs(det) < 1e-9:
-        return None
-    return -np.linalg.inv(r) @ t
+    return point, None
 
 
 def _polyline_length_3d(points: list[tuple[float, float, float]]) -> float:
@@ -298,16 +247,17 @@ def triangulate_throw(
             continue
 
         left_frames_attempted += 1
+        point_time_s: float | None = None
 
         if timeline is not None or left_point.time_s is not None:
-            target_time = (
+            point_time_s = (
                 left_point.time_s
                 if left_point.time_s is not None
                 else timeline.time_at_frame(left_point.frame)
             )
             secondary_coords = interpolate_track_at_time(
                 right_track,
-                target_time,
+                point_time_s,
                 time_at_frame=time_at_frame,
             )
             if secondary_coords is None:
@@ -330,7 +280,13 @@ def triangulate_throw(
                 continue
             right_xy = (float(right_point.x), float(right_point.y))
 
-        triangulated, _residual, rejection = _triangulate_point(
+        if point_time_s is None:
+            if left_point.time_s is not None:
+                point_time_s = left_point.time_s
+            elif left_point.frame is not None:
+                point_time_s = time_at_frame(left_point.frame)
+
+        triangulated, rejection = _triangulate_point(
             np.array([left_point.x, left_point.y], dtype=np.float64),
             np.array(right_xy, dtype=np.float64),
             model,
@@ -345,7 +301,7 @@ def triangulate_throw(
                 x=float(triangulated[0]),
                 y=float(triangulated[1]),
                 z=float(triangulated[2]),
-                time_s=target_time,
+                time_s=point_time_s,
             )
         )
 

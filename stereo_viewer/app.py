@@ -757,6 +757,14 @@ class StereoViewerApp:
             left_frame,
             right_frame,
             STEREO_DISPLAY_MAX_SIZE,
+            frame_provider=lambda: capture_stereo_pair(
+                mode=self.mode.get(),
+                frame_index=self.frame_index,
+                left_last_raw=self.left.last_raw_frame,
+                right_last_raw=self.right.last_raw_frame,
+                left_cap=self.left.cap,
+                right_cap=self.right.cap,
+            ),
         ).show()
 
     def _import_from_game_tracker(self) -> None:

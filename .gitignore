@@ -27,3 +27,4 @@ calibration.json
 
 # Downloaded model weights
 *.pt
+*.task

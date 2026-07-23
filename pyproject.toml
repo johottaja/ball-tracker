@@ -5,6 +5,7 @@ description = "Webcam recorder and frame-by-frame viewer with ball detection"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "mediapipe>=0.10.35",
     "opencv-python>=4.10",
     "pillow>=11.0",
     "torch>=2.12.0",

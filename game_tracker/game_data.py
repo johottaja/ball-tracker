@@ -72,7 +72,7 @@ class ThrowRecord:
     thrower_side: str = "right"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "id": self.id,
             "start_frame": self.start_frame,
             "end_frame": self.end_frame,
@@ -85,6 +85,7 @@ class ThrowRecord:
                 for camera, points in self.tracks_2d.items()
             },
         }
+        return d
 
 
 @dataclass

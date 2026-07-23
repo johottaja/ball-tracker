@@ -1,4 +1,5 @@
 from .dialog import TableCalibrationDialog
+from .fingertip import FingertipDetection, FingertipDetector
 from .frames import capture_stereo_pair
 from .homography import (
     build_table_calibration,
@@ -22,6 +23,7 @@ from .layout import (
     StereoScreenSideMapping,
 )
 from .layout_dialog import CameraLayoutDialog
+from .refine import refine_calibration_from_fingertips
 from .storage import attach_layout_stats, load_calibration, save_calibration
 from .types import (
     CalibrationLayout,
@@ -37,6 +39,8 @@ __all__ = [
     "CameraLayoutDialog",
     "CameraLayoutInfo",
     "CameraLayoutStats",
+    "FingertipDetection",
+    "FingertipDetector",
     "StereoLayoutStats",
     "StereoScreenSideMapping",
     "TableCalibration",
@@ -58,6 +62,7 @@ __all__ = [
     "load_calibration",
     "projection_matrix_from_corners",
     "projection_matrix_from_homography",
+    "refine_calibration_from_fingertips",
     "save_calibration",
     "table_corner_world_coords",
 ]
